@@ -85,8 +85,10 @@ def _send(text):
                     timeout=20
                 )
                 if r.status_code != 200:
+                    print(f"\n[NOTIFIER] ⚠️ TELEGRAM BLOCKED MESSAGE (Code {r.status_code}): {r.text}\n")
                     success = False
             except Exception as e:
+                print(f"\n[NOTIFIER] ⚠️ TELEGRAM NETWORK ERROR: {e}\n")
                 success = False
             time.sleep(0.5)
 
