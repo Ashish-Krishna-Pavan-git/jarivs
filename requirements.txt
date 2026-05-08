@@ -5,5 +5,5 @@ beautifulsoup4
 lxml
 edge-tts
 flask
-google-generativeai
+google-genai
 groq
