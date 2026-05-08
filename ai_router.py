@@ -1,6 +1,6 @@
 """
 ai_router.py
-Cloud API Version — Google Gemini 1.5 Flash (Primary) + Groq (Fallback)
+Cloud API Version — Google Gemini 2.5 Flash (Primary) + Groq (Fallback)
 Includes strict Thread-Safe Rate Limiting and Cyber-Security Safety Filter Bypasses.
 """
 
@@ -8,8 +8,10 @@ import json
 import time
 import os
 import threading
-import google.generativeai as genai
-from google.generativeai.types import HarmCategory, HarmBlockThreshold
+
+# Use the NEW Google GenAI SDK
+from google import genai
+from google.genai import types
 from groq import Groq
 
 from config import AI_MAX_CONTENT_CHARS
@@ -22,15 +24,13 @@ from config import AI_MAX_CONTENT_CHARS
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GROQ_API_KEY   = os.getenv("GROQ_API_KEY", "")
 
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    
+# Initialize Clients
+gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 # ─────────────────────────────────────────────────────────────
 # THREAD-SAFE RATE LIMITER
 # ─────────────────────────────────────────────────────────────
-# Prevents Google API from banning us (Free tier is 15 requests/minute)
 
 API_LOCK = threading.Lock()
 LAST_CALL_TIME = 0.0
@@ -80,9 +80,9 @@ Return this exact JSON:
     "Fix, patch, or mitigation"
   ],
   "tags":["tag1", "tag2"],
-  "cves": ["CVE-YYYY-NNNNN"],
+  "cves":["CVE-YYYY-NNNNN"],
   "actors": ["threat actor if any"],
-  "affected_products": ["product names if any"]
+  "affected_products":["product names if any"]
 }}
 
 SEVERITY GUIDE:
@@ -178,23 +178,40 @@ Return ONLY the JSON object."""
 # ─────────────────────────────────────────────────────────────
 
 def gemini_call(prompt):
-    if not GEMINI_API_KEY: 
+    if not gemini_client: 
         return None
     try:
-        dbg("Calling Google Gemini 1.5 Flash...")
-        # CRITICAL: We must disable safety settings so it doesn't block cybersecurity articles about hacking/exploits
-        safety_settings = {
-            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-        }
+        dbg("Calling Google Gemini 2.5 Flash...")
         
-        model = genai.GenerativeModel(
-            'gemini-1.5-flash',
-            generation_config={"response_mime_type": "application/json"} # Forces valid JSON
+        # New syntax for disabling safety filters so it doesn't block cybersec articles
+        safety_settings =[
+            types.SafetySetting(
+                category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+                threshold=types.HarmBlockThreshold.BLOCK_NONE,
+            ),
+            types.SafetySetting(
+                category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+                threshold=types.HarmBlockThreshold.BLOCK_NONE,
+            ),
+            types.SafetySetting(
+                category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+                threshold=types.HarmBlockThreshold.BLOCK_NONE,
+            ),
+            types.SafetySetting(
+                category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+                threshold=types.HarmBlockThreshold.BLOCK_NONE,
+            ),
+        ]
+        
+        # New syntax for generating content
+        response = gemini_client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                safety_settings=safety_settings
+            )
         )
-        response = model.generate_content(prompt, safety_settings=safety_settings)
         return response.text
     except Exception as e:
         dbg(f"Gemini error: {e}")
@@ -217,17 +234,14 @@ def groq_call(prompt):
 
 def local_call(prompt):
     """
-    Main routing function. Named 'local_call' to maintain compatibility 
-    with existing bot_listener.py and other files.
+    Main routing function. Named 'local_call' to maintain compatibility.
     """
-    # 1. Try Gemini first (4.1 second delay ensures <15 requests per minute)
     enforce_rate_limit(4.1)
     result = gemini_call(prompt)
     
-    # 2. Try Groq as backup if Gemini hits a daily cap or server error
     if not result:
         dbg("Gemini failed or rate-limited. Falling back to Groq...")
-        enforce_rate_limit(2.5) # Groq rate limit allowance
+        enforce_rate_limit(2.5)
         result = groq_call(prompt)
         
     return result
@@ -290,7 +304,6 @@ def ai_analyze(title, content):
     data   = extract_json(raw)
 
     if data:
-        # Sanity check: combine AI severity with keyword severity
         kw_sev = keyword_severity(title, content)
         ai_sev = data.get("severity", "LOW")
         sev_order =["MINIMAL", "LOW", "MEDIUM", "HIGH", "CRITICAL"]
@@ -305,11 +318,10 @@ def ai_analyze(title, content):
         "category": "tech",
         "confidence": 1,
         "summary":["API Analysis unavailable due to cloud error — keyword classification used"],
-        "tags": [], "cves": [], "actors": [], "affected_products":[]
+        "tags": [], "cves":[], "actors": [], "affected_products":[]
     }
 
 def ai_digest(items, cycle_label="8-hour cycle"):
-    """Summarizes an 8-hour batch into a magazine-style digest."""
     sev_map = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "MINIMAL": 1}
     sorted_items = sorted(items, key=lambda x: sev_map.get(x.get("severity", "LOW"), 0), reverse=True)
     
@@ -321,14 +333,13 @@ def ai_digest(items, cycle_label="8-hour cycle"):
             
         items_text += f"[{item.get('severity','?')}][Cat: {item.get('category','tech')}] {item.get('title','')}\n  {summary[:250]}\n\n"
         
-        if len(items_text) > 8000: # We can push this a bit higher since Gemini context is massive
+        if len(items_text) > 8000:
             break
 
     raw = local_call(build_digest_prompt(items_text, cycle_label))
     return extract_json(raw)
 
 def ai_daily_summary(digests):
-    """Correlates 3 daily digests into an Executive Summary."""
     digests_text = ""
     for i, d in enumerate(digests, 1):
         digests_text += f"\n--- DIGEST {i} ---\n{json.dumps(d, indent=2)}\n"
@@ -337,12 +348,11 @@ def ai_daily_summary(digests):
     return extract_json(raw)
 
 def ai_weekly_summary(items):
-    """Builds the Sunday 'Doom vs Bloom' weekly edition."""
     sev_map = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "MINIMAL": 1}
     sorted_items = sorted(items, key=lambda x: sev_map.get(x.get("severity", "LOW"), 0), reverse=True)
     
     items_text = ""
-    for i, item in enumerate(sorted_items[:40], 1): # Top 40 items only
+    for i, item in enumerate(sorted_items[:40], 1):
         summary = item.get("summary_text", "")
         items_text += f"[{item.get('severity','?')}] {item.get('title','')}\n  {summary[:200]}\n\n"
 
