@@ -182,39 +182,25 @@ def gemini_call(prompt):
         return None
     try:
         dbg("Calling Google Gemini 2.5 Flash...")
-        
-        # New syntax for disabling safety filters so it doesn't block cybersec articles
         safety_settings =[
-            types.SafetySetting(
-                category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-                threshold=types.HarmBlockThreshold.BLOCK_NONE,
-            ),
-            types.SafetySetting(
-                category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
-                threshold=types.HarmBlockThreshold.BLOCK_NONE,
-            ),
-            types.SafetySetting(
-                category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-                threshold=types.HarmBlockThreshold.BLOCK_NONE,
-            ),
-            types.SafetySetting(
-                category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-                threshold=types.HarmBlockThreshold.BLOCK_NONE,
-            ),
+            types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=types.HarmBlockThreshold.BLOCK_NONE),
+            types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
+            types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
+            types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
         ]
         
-        # New syntax for generating content
         response = gemini_client.models.generate_content(
             model='gemini-2.5-flash',
             contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                safety_settings=safety_settings
-            )
+            config=types.GenerateContentConfig(response_mime_type="application/json", safety_settings=safety_settings)
         )
         return response.text
     except Exception as e:
-        dbg(f"Gemini error: {e}")
+        err_msg = str(e).lower()
+        if "429" in err_msg or "quota" in err_msg or "exhausted" in err_msg:
+            dbg("Gemini Quota Exceeded — Skipping instantly to Groq (No waiting!)...")
+        else:
+            dbg(f"Gemini error: {e}")
         return None
 
 def groq_call(prompt):
@@ -304,12 +290,7 @@ def ai_analyze(title, content):
     data   = extract_json(raw)
 
     if data:
-        kw_sev = keyword_severity(title, content)
-        ai_sev = data.get("severity", "LOW")
-        sev_order =["MINIMAL", "LOW", "MEDIUM", "HIGH", "CRITICAL"]
-        ai_idx    = sev_order.index(ai_sev) if ai_sev in sev_order else 2
-        kw_idx    = sev_order.index(kw_sev)
-        data["severity"] = sev_order[max(ai_idx, kw_idx)]
+        # Trust the AI! Removed the bug that forced everything to CRITICAL.
         return data
 
     dbg("AI completely failed — using keyword fallback")
@@ -318,7 +299,7 @@ def ai_analyze(title, content):
         "category": "tech",
         "confidence": 1,
         "summary":["API Analysis unavailable due to cloud error — keyword classification used"],
-        "tags": [], "cves":[], "actors": [], "affected_products":[]
+        "tags": [], "cves":[], "actors":[], "affected_products":
     }
 
 def ai_digest(items, cycle_label="8-hour cycle"):
