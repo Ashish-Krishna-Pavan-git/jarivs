@@ -300,8 +300,7 @@ def ai_analyze(title, content):
         "confidence": 1,
         "summary":["API Analysis unavailable due to cloud error — keyword classification used"],
         "tags": [], "cves":[], "actors":[], "affected_products":
-    }
-
+        
 def ai_digest(items, cycle_label="8-hour cycle"):
     sev_map = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "MINIMAL": 1}
     sorted_items = sorted(items, key=lambda x: sev_map.get(x.get("severity", "LOW"), 0), reverse=True)
