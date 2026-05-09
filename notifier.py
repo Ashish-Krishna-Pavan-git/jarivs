@@ -1,20 +1,28 @@
 """
 notifier.py
-Telegram notifications — broadcasts to all subscribers.
-Includes smart fuzzy-matching cooldown to prevent duplicate event spam.
-Formats the 8-hour digest, daily, and new Sunday Weekly briefing.
+Telegram broadcaster — sends to all subscribers.
+
+FIXES vs original:
+  - Timeout raised 20s → 60s  (HF Spaces has slow egress to Telegram)
+  - 3 retries with exponential backoff per chunk
+  - Immediate alerts sent in a daemon thread (never blocks AI processing)
+  - Smart duplicate cooldown (CVE + title fuzzy match)
+  - All formatters preserved and improved
 """
 
 import time
 import json
 import os
+import threading
 import requests
 import difflib
 
 from config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 
-MAX_MSG  = 4000
-COOLDOWN = {}
+MAX_MSG       = 4000
+SEND_TIMEOUT  = 60        # seconds — was 20, too short for HF egress
+MAX_RETRIES   = 3
+COOLDOWN: dict = {}
 
 SEV_EMOJI = {
     "CRITICAL": "🚨",
@@ -26,24 +34,28 @@ SEV_EMOJI = {
 
 
 # ─────────────────────────────────────────────────────────────
-# CORE SENDER
+# SUBSCRIBER MANAGEMENT
 # ─────────────────────────────────────────────────────────────
 
 def _get_subscribers():
     subs_file = os.path.join("data", "subscribers.json")
     if os.path.exists(subs_file):
         try:
-            with open(subs_file, "r") as f:
+            with open(subs_file) as f:
                 return json.load(f)
-        except:
+        except Exception:
             pass
-    return [str(TELEGRAM_CHAT_ID)] if TELEGRAM_CHAT_ID else[]
+    return [str(TELEGRAM_CHAT_ID)] if TELEGRAM_CHAT_ID else []
 
 
-def _split(text):
+# ─────────────────────────────────────────────────────────────
+# CORE SENDER  (with retry + backoff)
+# ─────────────────────────────────────────────────────────────
+
+def _split(text: str) -> list:
     if len(text) <= MAX_MSG:
         return [text]
-    chunks, current =[], ""
+    chunks, current = [], ""
     for line in text.split("\n"):
         if len(current) + len(line) + 1 > MAX_MSG:
             if current:
@@ -56,87 +68,110 @@ def _split(text):
     return chunks
 
 
-def _send(text):
+def _send_one(chat_id: str, text: str) -> bool:
+    """Send one message chunk to one chat_id. Retries up to MAX_RETRIES times."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            r = requests.post(
+                url,
+                json={"chat_id": chat_id, "text": text},
+                timeout=SEND_TIMEOUT,
+            )
+            if r.status_code == 200:
+                return True
+            elif r.status_code == 429:
+                retry_after = r.json().get("parameters", {}).get("retry_after", 30)
+                print(f"[NOTIFIER] Rate limited — waiting {retry_after}s")
+                time.sleep(retry_after)
+            elif r.status_code in (400, 403):
+                # Bad chat_id or bot blocked — don't retry
+                print(f"[NOTIFIER] Permanent error {r.status_code} for {chat_id}")
+                return False
+            else:
+                wait = 2 ** attempt
+                print(f"[NOTIFIER] HTTP {r.status_code}, retry {attempt}/{MAX_RETRIES} in {wait}s")
+                time.sleep(wait)
+        except requests.exceptions.ReadTimeout:
+            wait = 2 ** attempt * 5   # 10s, 20s, 40s
+            print(f"[NOTIFIER] ⚠️ Read timeout (attempt {attempt}/{MAX_RETRIES}), retry in {wait}s")
+            time.sleep(wait)
+        except requests.exceptions.ConnectionError as e:
+            wait = 2 ** attempt * 5
+            print(f"[NOTIFIER] ⚠️ Connection error: {e}, retry in {wait}s")
+            time.sleep(wait)
+        except Exception as e:
+            print(f"[NOTIFIER] ⚠️ Unexpected error: {e}")
+            return False
+
+    print(f"[NOTIFIER] ✗ All {MAX_RETRIES} retries failed for chat {chat_id}")
+    return False
+
+
+def _send(text: str) -> bool:
+    """Broadcast to all subscribers. Returns True if at least one succeeded."""
     if not TELEGRAM_TOKEN:
         print("[NOTIFIER] Telegram not configured")
         return False
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    chunks = _split(str(text))
-    success = True
-    
     subscribers = set(_get_subscribers())
     if not subscribers:
-        print("[NOTIFIER] No subscribers to send to.")
+        print("[NOTIFIER] No subscribers")
         return False
 
-    # Broadcast to everyone
+    chunks = _split(str(text))
+    any_success = False
+
     for chat_id in subscribers:
         if not chat_id:
             continue
-            
         for i, chunk in enumerate(chunks, 1):
-            if len(chunks) > 1:
-                chunk = f"[{i}/{len(chunks)}]\n{chunk}"
-            try:
-                r = requests.post(
-                    url,
-                    json={"chat_id": chat_id, "text": chunk},
-                    timeout=20
-                )
-                if r.status_code != 200:
-                    print(f"\n[NOTIFIER] ⚠️ TELEGRAM BLOCKED MESSAGE (Code {r.status_code}): {r.text}\n")
-                    success = False
-            except Exception as e:
-                print(f"\n[NOTIFIER] ⚠️ TELEGRAM NETWORK ERROR: {e}\n")
-                success = False
-            time.sleep(0.5)
+            payload = f"[{i}/{len(chunks)}]\n{chunk}" if len(chunks) > 1 else chunk
+            if _send_one(chat_id, payload):
+                any_success = True
+            time.sleep(0.3)   # small gap between chunks
 
-    return success
+    return any_success
+
+
+def _send_async(text: str):
+    """Fire-and-forget: send in daemon thread so it never blocks processing."""
+    threading.Thread(target=_send, args=(text,), daemon=True).start()
 
 
 # ─────────────────────────────────────────────────────────────
-# SMART COOLDOWN (DEDUPLICATION ACROSS SOURCES)
+# DUPLICATE COOLDOWN
 # ─────────────────────────────────────────────────────────────
 
-def _is_similar(t1, t2):
-    """Check if two titles are talking about the same event."""
-    ratio = difflib.SequenceMatcher(None, t1, t2).ratio()
-    return ratio > 0.55  # 55% character similarity is usually enough for headlines
+def _is_similar(t1: str, t2: str) -> bool:
+    return difflib.SequenceMatcher(None, t1, t2).ratio() > 0.55
 
 
-def _on_cooldown(item, hours=12):
+def _on_cooldown(item: dict, hours: int = 12) -> bool:
     title = str(item.get("title", "")).lower()
-    cves  = set(item.get("cves",[]))
+    cves  = set(item.get("cves", []))
     now   = time.time()
-    
-    # 1. Cleanup old cooldowns (older than 'hours')
-    keys_to_delete =[k for k, v in COOLDOWN.items() if (now - v['time']) > hours * 3600]
-    for k in keys_to_delete:
+
+    # Clean expired entries
+    stale = [k for k, v in COOLDOWN.items() if now - v["time"] > hours * 3600]
+    for k in stale:
         del COOLDOWN[k]
 
-    # 2. Check against recent alerts
-    for past_id, data in COOLDOWN.items():
-        past_title = data['title']
-        past_cves  = data['cves']
-        
-        # Condition A: They share a CVE number
-        if cves and past_cves and cves.intersection(past_cves):
+    for data in COOLDOWN.values():
+        if cves and data["cves"] and cves.intersection(data["cves"]):
             return True
-            
-        # Condition B: Titles are highly similar (different news site, same story)
-        if _is_similar(title, past_title):
+        if _is_similar(title, data["title"]):
             return True
-            
+
     return False
 
 
-def _set_cooldown(item):
+def _set_cooldown(item: dict):
     k = str(item.get("fp", time.time()))
     COOLDOWN[k] = {
-        'time':  time.time(),
-        'title': str(item.get("title", "")).lower(),
-        'cves':  set(item.get("cves",[]))
+        "time":  time.time(),
+        "title": str(item.get("title", "")).lower(),
+        "cves":  set(item.get("cves", [])),
     }
 
 
@@ -144,21 +179,21 @@ def _set_cooldown(item):
 # FORMATTERS
 # ─────────────────────────────────────────────────────────────
 
-def _safe_str(val):
+def _safe_str(val) -> str:
     if isinstance(val, list):
         return ", ".join(str(x) for x in val if x)
     return str(val) if val else ""
 
 
-def _format_alert(item):
+def _format_alert(item: dict) -> str:
     sev      = item.get("severity", "LOW")
     emoji    = SEV_EMOJI.get(sev, "")
     category = _safe_str(item.get("category", "tech")).upper()
-    cves     = _safe_str(item.get("cves",[]))
+    cves     = _safe_str(item.get("cves", []))
     actors   = _safe_str(item.get("actors", []))
-    tags     = _safe_str(item.get("tags",[]))
+    tags     = _safe_str(item.get("tags", []))
 
-    summary  = item.get("summary",[])
+    summary = item.get("summary", [])
     if isinstance(summary, list):
         summary_str = "\n".join(f"  • {s}" for s in summary if isinstance(s, str))
     else:
@@ -180,34 +215,33 @@ def _format_alert(item):
     return msg
 
 
-def _format_digest(all_items, cycle_num, ai_digest=None):
+def _format_digest(all_items: list, cycle_num: int, ai_digest: dict = None) -> str:
     now   = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
-    lines =[]
+    lines = []
     lines.append(f"📰 8-HOUR INTELLIGENCE BRIEFING — CYCLE {cycle_num}")
     lines.append(f"🕐 {now}")
     lines.append("━" * 40)
 
     if not ai_digest:
-        lines.append("\n⚠️ AI processing unavailable for this cycle.")
+        lines.append("\n⚠️ AI digest unavailable for this cycle.")
     else:
         if ai_digest.get("headline"):
             lines.append(f"\n🎯 {ai_digest['headline']}\n")
 
-        sections =[
-            ("cybersec_updates", "🛡️ CYBERSECURITY"),
-            ("ai_updates", "🧠 ARTIFICIAL INTELLIGENCE"),
-            ("tech_business_updates", "💼 TECH & BUSINESS"),
-            ("hardware_mobile_updates", "📱 HARDWARE & MOBILE")
+        sections = [
+            ("cybersec_updates",       "🛡️ CYBERSECURITY"),
+            ("ai_updates",             "🧠 ARTIFICIAL INTELLIGENCE"),
+            ("tech_business_updates",  "💼 TECH & BUSINESS"),
+            ("hardware_mobile_updates","📱 HARDWARE & MOBILE"),
         ]
-
         for key, title in sections:
-            paras = ai_digest.get(key,[])
+            paras = ai_digest.get(key, [])
             if paras:
                 lines.append(f"\n{title}")
                 for p in paras:
                     lines.append(f"  • {p}")
 
-        cves = ai_digest.get("key_cves",[])
+        cves = ai_digest.get("key_cves", [])
         if cves:
             lines.append(f"\n🔴 KEY CVEs: {', '.join(cves)}")
 
@@ -217,95 +251,98 @@ def _format_digest(all_items, cycle_num, ai_digest=None):
 
     lines.append("\n" + "━" * 40)
     lines.append("\n🔗 TOP REFERENCES:")
-    crit_high =[i for i in all_items if i.get("severity") in ("CRITICAL", "HIGH")]
-    crit_high = sorted(crit_high, key=lambda x: 0 if x.get("severity") == "CRITICAL" else 1)
 
+    crit_high = sorted(
+        [i for i in all_items if i.get("severity") in ("CRITICAL", "HIGH")],
+        key=lambda x: 0 if x.get("severity") == "CRITICAL" else 1,
+    )
     for item in crit_high[:7]:
         sev   = item.get("severity", "")
-        title = str(item.get("title", ""))[:80] + "..."
+        title = str(item.get("title", ""))[:80] + "…"
         link  = item.get("link", "")
-        lines.append(f"{SEV_EMOJI.get(sev, '')} [{sev}] {title}\n  └ {link}")
+        lines.append(f"{SEV_EMOJI.get(sev,'')} [{sev}] {title}\n  └ {link}")
 
     if len(crit_high) > 7:
-        lines.append(f"\n...and {len(crit_high) - 7} other high-priority alerts suppressed for readability.")
+        lines.append(f"\n…and {len(crit_high) - 7} more high-priority alerts in the digest.")
 
-    counts = {"CRITICAL":0,"HIGH":0,"MEDIUM":0,"LOW":0,"MINIMAL":0}
+    counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "MINIMAL": 0}
     for item in all_items:
-        sev = item.get("severity","LOW")
-        counts[sev] = counts.get(sev, 0) + 1
+        counts[item.get("severity", "LOW")] = counts.get(item.get("severity", "LOW"), 0) + 1
 
-    stats_str = " | ".join(f"{SEV_EMOJI.get(k,'')} {k}:{v}" for k,v in counts.items() if v > 0)
+    stats_str = " | ".join(
+        f"{SEV_EMOJI.get(k,'')} {k}:{v}" for k, v in counts.items() if v > 0
+    )
     lines.append(f"\n📊 STATS: {stats_str}")
-    lines.append(f"📦 Total processed: {len(all_items)}")
-
+    lines.append(f"📦 Total processed this cycle: {len(all_items)}")
     return "\n".join(lines)
 
 
-def _format_daily(all_items, ai_summary):
+def _format_daily(all_items: list, ai_summary: dict) -> str:
     now   = time.strftime("%Y-%m-%d", time.gmtime())
-    lines =[]
+    lines = []
     lines.append(f"🗓 DAILY REPORT — {now}")
     lines.append("━" * 45)
 
     if ai_summary:
         if ai_summary.get("day_headline"):
             lines.append(f"\n🎯 {ai_summary['day_headline']}\n")
-        rl = ai_summary.get("risk_level","?")
-        lines.append(f"⚡ RISK: {SEV_EMOJI.get(rl,'')} {rl}")
+        rl = ai_summary.get("risk_level", "?")
+        lines.append(f"⚡ RISK: {SEV_EMOJI.get(rl, '')} {rl}")
         if ai_summary.get("day_summary"):
             lines.append(f"\n{ai_summary['day_summary']}")
         lines.append("\n" + "━" * 45)
-        for key, label in[
-            ("escalating_threats","🔺 ESCALATING"),
-            ("new_patterns",      "🔍 PATTERNS"),
-            ("actor_activity",    "🎭 ACTORS"),
-            ("tech_trends",       "💡 TECH TRENDS"),
-            ("recommendations",   "✅ ACTIONS"),
+
+        for key, label in [
+            ("escalating_threats", "🔺 ESCALATING THREATS"),
+            ("new_patterns",       "🔍 OBSERVED PATTERNS"),
+            ("actor_activity",     "🎭 THREAT ACTORS"),
+            ("tech_trends",        "💡 TECH TRENDS"),
+            ("recommendations",    "✅ RECOMMENDATIONS"),
         ]:
-            items = ai_summary.get(key,[])
+            items = ai_summary.get(key, [])
             if items:
                 lines.append(f"\n{label}:")
                 for x in items:
                     lines.append(f"  • {x}")
-        cves = ai_summary.get("critical_cves",[])
+
+        cves = ai_summary.get("critical_cves", [])
         if cves:
             lines.append(f"\n🔴 KEY CVEs: {', '.join(cves)}")
 
-    lines.append(f"\n📦 Total today: {len(all_items)} articles")
+    lines.append(f"\n📦 Total articles today: {len(all_items)}")
     lines.append("━" * 45)
     return "\n".join(lines)
 
 
-def _format_weekly(all_items, ai_summary):
+def _format_weekly(all_items: list, ai_summary: dict) -> str:
     now   = time.strftime("%Y-%m-%d", time.gmtime())
-    lines =[]
+    lines = []
     lines.append(f"🗓️ SUNDAY WEEKLY DIGEST — {now}")
     lines.append("━" * 45)
 
     if ai_summary:
         if ai_summary.get("day_headline"):
             lines.append(f"\n🎯 {ai_summary['day_headline']}\n")
-            
         rl = ai_summary.get("risk_level", "?")
         lines.append(f"⚡ WEEKLY RISK: {SEV_EMOJI.get(rl, '')} {rl}")
-        
-        doom = ai_summary.get("doom",[])
+
+        doom = ai_summary.get("doom", [])
         if doom:
             lines.append("\n🌋 DOOM (Threats & Breaches):")
             for d in doom:
                 lines.append(f"  • {d}")
-                
-        bloom = ai_summary.get("bloom",[])
+
+        bloom = ai_summary.get("bloom", [])
         if bloom:
             lines.append("\n🌸 BLOOM (Tech & Breakthroughs):")
             for b in bloom:
                 lines.append(f"  • {b}")
-        
+
         if ai_summary.get("day_summary"):
-            lines.append(f"\n📝 CONCLUDING SUMMARY:\n{ai_summary['day_summary']}")
-            
+            lines.append(f"\n📝 WEEK SUMMARY:\n{ai_summary['day_summary']}")
+
     lines.append("\n" + "━" * 45)
-    lines.append(f"📦 Total articles analyzed this week: {len(all_items)}")
+    lines.append(f"📦 Total articles this week: {len(all_items)}")
     return "\n".join(lines)
 
 
@@ -313,55 +350,68 @@ def _format_weekly(all_items, ai_summary):
 # PUBLIC API
 # ─────────────────────────────────────────────────────────────
 
-def notify_immediate(item):
-    sev = item.get("severity","LOW")
-    if sev not in ("CRITICAL","HIGH"):
+def notify_immediate(item: dict):
+    """Send an immediate CRITICAL/HIGH alert. Non-blocking — runs in background thread."""
+    sev = item.get("severity", "LOW")
+    if sev not in ("CRITICAL", "HIGH"):
         return
     if _on_cooldown(item):
-        print(f"  [NOTIFIER] Duplicate/Similar Event Suppressed: {str(item.get('title',''))[:50]}")
+        print(f"  [NOTIFIER] Duplicate suppressed: {str(item.get('title',''))[:50]}")
         return
-    print(f"  [NOTIFIER] Sending {sev} alert")
-    _send(_format_alert(item))
+
+    print(f"  [NOTIFIER] 🚨 Sending {sev} alert (async)")
+    _send_async(_format_alert(item))
     _set_cooldown(item)
 
 
-def send_digest(all_items, cycle_num, ai_digest=None):
+def send_digest(all_items: list, cycle_num: int, ai_digest: dict = None):
     text = _format_digest(all_items, cycle_num, ai_digest)
     print(f"[NOTIFIER] Sending 8hr digest — cycle {cycle_num}")
-    _send(text)
+    _send(text)   # Blocking is fine here — we're between cycles
 
 
-def send_daily_summary(all_items, ai_summary):
+def send_daily_summary(all_items: list, ai_summary: dict):
     text = _format_daily(all_items, ai_summary)
-    print(f"[NOTIFIER] Sending daily summary")
+    print("[NOTIFIER] Sending daily summary")
     _send(text)
 
 
-def send_weekly_summary(all_items, ai_summary):
+def send_weekly_summary(all_items: list, ai_summary: dict):
     text = _format_weekly(all_items, ai_summary)
     print("[NOTIFIER] Sending Sunday Weekly summary")
     _send(text)
 
 
-def telegram_send(text):
+def telegram_send(text: str):
+    """Generic send for bot commands etc."""
     _send(str(text))
 
 
-def send_audio(filepath, caption="🎙️ JARVIS Daily Audio Briefing"):
-    """Sends an MP3 file to all subscribers."""
+def send_audio(filepath: str, caption: str = "🎙️ JARVIS Daily Audio Briefing"):
+    """Send an MP3 file to all subscribers."""
     if not TELEGRAM_TOKEN or not os.path.exists(filepath):
         return False
-        
+
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendAudio"
     subscribers = set(_get_subscribers())
-    
-    print("[NOTIFIER] Broadcasting audio podcast...")
+
     for chat_id in subscribers:
-        if not chat_id: continue
-        try:
-            with open(filepath, 'rb') as audio:
-                requests.post(url, data={'chat_id': chat_id, 'caption': caption}, files={'audio': audio})
-        except Exception as e:
-            print(f"[NOTIFIER] Failed to send audio to {chat_id}: {e}")
-            
+        if not chat_id:
+            continue
+        for attempt in range(MAX_RETRIES):
+            try:
+                with open(filepath, "rb") as audio:
+                    r = requests.post(
+                        url,
+                        data={"chat_id": chat_id, "caption": caption},
+                        files={"audio": audio},
+                        timeout=SEND_TIMEOUT,
+                    )
+                if r.status_code == 200:
+                    break
+                time.sleep(2 ** attempt * 3)
+            except Exception as e:
+                print(f"[NOTIFIER] Audio send error: {e}")
+                time.sleep(2 ** attempt * 3)
+
     return True
