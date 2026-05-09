@@ -228,7 +228,7 @@ def run_worker():
             result = process_item(item)
             processed_all.append(result)
             mark_done(item["id"])
-            mark_as_seen([article])
+            mark_as_seen([article])   # In-memory only — no disk write per article
 
         except Exception as e:
             print(f"[WORKER] ⚠️ Error on item: {e}")
@@ -240,4 +240,7 @@ def run_worker():
         time.sleep(0.5)   # Small gap between articles (rate limiter handles AI waits)
 
     print(f"\n[WORKER] ✓ Complete: {len(processed_all)} processed, {len(failed_all)} failed")
+    # Flush seen fingerprints to disk ONCE (not per-article — huge speed improvement)
+    from dedupe import flush_seen
+    flush_seen()
     return processed_all, failed_all

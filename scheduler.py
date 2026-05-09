@@ -35,8 +35,8 @@ from storage_backend  import pull_state, push_state, is_configured
 # ─────────────────────────────────────────────────────────────
 # TESTING TOGGLES  (both False for production)
 # ─────────────────────────────────────────────────────────────
-TEST_MODE_DAILY  = True   # True → trigger 7 AM daily summary right after next cycle
-TEST_MODE_WEEKLY = True   # True → trigger Sunday Doom vs Bloom right after next cycle
+TEST_MODE_DAILY  = False   # True → trigger 7 AM daily summary right after next cycle
+TEST_MODE_WEEKLY = False   # True → trigger Sunday Doom vs Bloom right after next cycle
 
 # Indian Standard Time (UTC+5:30)
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -105,6 +105,9 @@ def run_cycle():
     # ── 2. Clear in-memory queue from previous cycle ──
     clear_all()
     reset_stuck()
+    # Reset dedupe cache so it reloads from disk (picks up HF-pulled seen.json)
+    from dedupe import reset_cache
+    reset_cache()
 
     # ── 3. Collect articles ──
     print("[CYCLE] Collecting from all RSS sources...")
