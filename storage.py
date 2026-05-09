@@ -1,29 +1,41 @@
 """
 storage.py
-Saves processed articles as JSON + Markdown.
-All severities saved. Directory structure: data/processed/YYYY-MM-DD/
+Article + digest persistence.
+
+CHANGES vs original:
+  - Uses /tmp/jarvis/data/ (always writable on HF Spaces)
+  - load_last_n_hours() supplements local files with HF bundle
+    so daily/weekly summaries survive space restarts
 """
 
 import os
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from config import PROCESSED_DIR, RAW_DIR
+from config import PROCESSED_DIR, DAILY_DIR, RAW_DIR
 
 
-def _today_dir():
+# ─────────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────────
+
+def _today_dir() -> str:
     day  = datetime.utcnow().strftime("%Y-%m-%d")
     path = os.path.join(PROCESSED_DIR, day)
     os.makedirs(path, exist_ok=True)
     return path
 
 
-def _ts():
-    return datetime.utcnow().strftime("%H-%M-%S-%f")[:-3]  # ms precision
+def _ts() -> str:
+    return datetime.utcnow().strftime("%H-%M-%S-%f")[:-3]
 
 
-def save_article(item):
-    """Save a single processed article to JSON + Markdown."""
+# ─────────────────────────────────────────────────────────────
+# ARTICLE SAVE / LOAD
+# ─────────────────────────────────────────────────────────────
+
+def save_article(item: dict) -> str:
+    """Save a single processed article as JSON + Markdown."""
     folder = _today_dir()
     ts     = _ts()
     slug   = item.get("severity", "UNK")
@@ -31,12 +43,11 @@ def save_article(item):
     json_path = os.path.join(folder, f"{ts}_{slug}.json")
     md_path   = os.path.join(folder, f"{ts}_{slug}.md")
 
-    # Ensure summary is a string for storage
     summary = item.get("summary", [])
     if isinstance(summary, list):
         summary_str = "\n".join(f"• {s}" for s in summary)
     else:
-        summary_str = summary
+        summary_str = str(summary)
 
     item["saved_at"] = datetime.utcnow().isoformat()
 
@@ -44,17 +55,17 @@ def save_article(item):
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(item, f, indent=2, ensure_ascii=False)
 
-    # ── MARKDOWN ──
+    # ── Markdown ──
+    sev   = item.get("severity", "?")
+    emoji = {"CRITICAL": "🚨", "HIGH": "⚠️", "MEDIUM": "📌",
+             "LOW": "📄", "MINIMAL": "ℹ️"}.get(sev, "")
     with open(md_path, "w", encoding="utf-8") as f:
-        sev   = item.get("severity", "?")
-        emoji = {"CRITICAL": "🚨", "HIGH": "⚠️", "MEDIUM": "📌",
-                 "LOW": "📄", "MINIMAL": "ℹ️"}.get(sev, "")
-        f.write(f"# {emoji} [{sev}] {item['title']}\n\n")
-        f.write(f"**Source:** {item.get('source', '?')}  \n")
-        f.write(f"**Category:** {item.get('category', '?')}  \n")
+        f.write(f"# {emoji} [{sev}] {item.get('title','')}\n\n")
+        f.write(f"**Source:** {item.get('source','?')}  \n")
+        f.write(f"**Category:** {item.get('category','?')}  \n")
         f.write(f"**Severity:** {sev}  \n")
-        f.write(f"**Confidence:** {item.get('confidence', '?')}/10  \n")
-        f.write(f"**Link:** {item.get('link', '')}  \n")
+        f.write(f"**Confidence:** {item.get('confidence','?')}/10  \n")
+        f.write(f"**Link:** {item.get('link','')}  \n")
         f.write(f"**Saved:** {item['saved_at']}  \n\n")
         f.write("## Summary\n\n")
         f.write(summary_str + "\n\n")
@@ -71,8 +82,7 @@ def save_article(item):
     return json_path
 
 
-def save_items(items):
-    """Save a list of processed articles."""
+def save_items(items: list):
     saved = 0
     for item in items:
         try:
@@ -83,39 +93,63 @@ def save_items(items):
     print(f"[STORAGE] Saved {saved}/{len(items)} articles")
 
 
-def load_last_n_hours(hours=24):
-    """Load all saved articles from the last N hours."""
-    from datetime import timedelta
-    results = []
-    cutoff  = datetime.utcnow() - timedelta(hours=hours)
+def load_last_n_hours(hours: int = 24) -> list:
+    """
+    Load articles from the last N hours.
+    Checks local files first (current session), then supplements with HF bundle
+    (previous sessions — survives restarts).
+    """
+    results   = []
+    local_fps = set()
+    cutoff    = datetime.utcnow() - timedelta(hours=hours)
 
-    if not os.path.exists(PROCESSED_DIR):
-        return results
-
-    for root, _, files in os.walk(PROCESSED_DIR):
-        for fname in files:
-            if not fname.endswith(".json"):
-                continue
-            path = os.path.join(root, fname)
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    item = json.load(f)
-                ts = item.get("saved_at")
-                if not ts:
+    # ── 1. Local files (fast, current session) ──
+    if os.path.exists(PROCESSED_DIR):
+        for root, _, files in os.walk(PROCESSED_DIR):
+            for fname in files:
+                if not fname.endswith(".json"):
                     continue
-                dt = datetime.fromisoformat(ts)
-                if dt >= cutoff:
-                    results.append(item)
-            except:
-                continue
+                path = os.path.join(root, fname)
+                try:
+                    with open(path, encoding="utf-8") as f:
+                        item = json.load(f)
+                    ts = item.get("saved_at")
+                    if ts and datetime.fromisoformat(ts) >= cutoff:
+                        results.append(item)
+                        local_fps.add(item.get("fp", item.get("title", "")))
+                except Exception:
+                    continue
 
+    # ── 2. HF bundle (previous sessions — fills gaps after restarts) ──
+    try:
+        from storage_backend import load_bundle
+        bundle = load_bundle()
+        for item in bundle:
+            ts = item.get("saved_at")
+            if not ts:
+                continue
+            try:
+                dt = datetime.fromisoformat(ts)
+                fp = item.get("fp", item.get("title", ""))
+                if dt >= cutoff and fp not in local_fps:
+                    results.append(item)
+                    local_fps.add(fp)
+            except Exception:
+                continue
+    except ImportError:
+        pass
+
+    print(f"[STORAGE] load_last_{hours}h → {len(results)} articles")
     return results
 
 
-def save_digest(digest_data, cycle_num):
-    """Save 8hr digest JSON."""
+# ─────────────────────────────────────────────────────────────
+# DIGEST SAVE / LOAD
+# ─────────────────────────────────────────────────────────────
+
+def save_digest(digest_data: dict, cycle_num: int) -> str:
     day    = datetime.utcnow().strftime("%Y-%m-%d")
-    folder = os.path.join("data", "daily", day)
+    folder = os.path.join(DAILY_DIR, day)
     os.makedirs(folder, exist_ok=True)
     path = os.path.join(folder, f"digest_cycle_{cycle_num}.json")
     with open(path, "w", encoding="utf-8") as f:
@@ -123,10 +157,26 @@ def save_digest(digest_data, cycle_num):
     return path
 
 
-def save_daily_report(report_data, report_text):
-    """Save daily summary JSON + txt."""
+def load_today_digests() -> list:
     day    = datetime.utcnow().strftime("%Y-%m-%d")
-    folder = os.path.join("data", "daily", day)
+    folder = os.path.join(DAILY_DIR, day)
+    digests = []
+    if not os.path.exists(folder):
+        return digests
+    for i in range(1, 5):   # Up to 4 digests per day (flexible)
+        path = os.path.join(folder, f"digest_cycle_{i}.json")
+        if os.path.exists(path):
+            try:
+                with open(path) as f:
+                    digests.append(json.load(f))
+            except Exception:
+                pass
+    return digests
+
+
+def save_daily_report(report_data: dict, report_text: str) -> str:
+    day    = datetime.utcnow().strftime("%Y-%m-%d")
+    folder = os.path.join(DAILY_DIR, day)
     os.makedirs(folder, exist_ok=True)
 
     json_path = os.path.join(folder, "daily_summary.json")
@@ -138,24 +188,3 @@ def save_daily_report(report_data, report_text):
         f.write(report_text)
 
     return txt_path
-
-
-def load_today_digests():
-    """Load today's saved digest files."""
-    day    = datetime.utcnow().strftime("%Y-%m-%d")
-    folder = os.path.join("data", "daily", day)
-    digests = []
-
-    if not os.path.exists(folder):
-        return digests
-
-    for i in range(1, 4):
-        path = os.path.join(folder, f"digest_cycle_{i}.json")
-        if os.path.exists(path):
-            try:
-                with open(path, "r") as f:
-                    digests.append(json.load(f))
-            except:
-                pass
-
-    return digests
