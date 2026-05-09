@@ -1,204 +1,185 @@
 """
 scraper.py
-Fetches full article content from URLs.
-Detects paywalls, falls back to RSS summary if blocked.
+Attempts to scrape full article text from URL.
+Falls back to RSS summary on any error, paywall, or short content.
+
+Extraction priority:
+  1. trafilatura  (best quality, pip install trafilatura)
+  2. BeautifulSoup + lxml/html.parser  (wide availability)
+  3. Regex-based raw strip  (stdlib-only fallback)
 """
 
 import re
 import requests
+
 from config import SCRAPE_TIMEOUT, SCRAPE_MAX_CHARS, RSS_FALLBACK_CHARS
 
-try:
-    from bs4 import BeautifulSoup
-    BS4_OK = True
-except ImportError:
-    BS4_OK = False
-    print("[WARN] beautifulsoup4 not installed — using fallback text extraction")
-
-
 # ─────────────────────────────────────────────────────────────
-# PAYWALL SIGNATURES
+# CONSTANTS
 # ─────────────────────────────────────────────────────────────
 
-PAYWALL_DOMAINS = {
-    "bloomberg.com",
-    "wsj.com",
-    "ft.com",
-    "nytimes.com",
-    "washingtonpost.com",
-    "economist.com",
-    "businessinsider.com",
-    "thetimes.co.uk",
-}
-
-PAYWALL_MARKERS = [
-    "subscribe to read",
-    "subscribe to continue",
-    "create a free account",
-    "sign in to read",
-    "premium content",
-    "this article is for subscribers",
-    "already a subscriber",
-    "paywall",
-    "members only",
-]
-
-HEADERS = {
+_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
+    "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate",
+}
+
+_PAYWALL_SIGNALS = [
+    "subscribe to read", "subscription required", "become a member",
+    "sign in to read", "login to continue", "premium content",
+    "to unlock this article", "this content is for subscribers",
+    "create a free account", "register to read", "paywall",
+]
+
+_SKIP_DOMAINS = {
+    "twitter.com", "x.com", "facebook.com", "instagram.com",
+    "tiktok.com", "reddit.com", "youtube.com",
 }
 
 
 # ─────────────────────────────────────────────────────────────
-# HELPERS
+# EXTRACTION HELPERS
 # ─────────────────────────────────────────────────────────────
 
-def is_paywalled_domain(url):
-    for domain in PAYWALL_DOMAINS:
-        if domain in url:
-            return True
-    return False
+def _extract_trafilatura(raw: bytes) -> str:
+    try:
+        import trafilatura
+        text = trafilatura.extract(
+            raw,
+            include_comments=False,
+            include_tables=False,
+            no_fallback=False,
+        )
+        return text or ""
+    except ImportError:
+        return ""
+    except Exception:
+        return ""
 
 
-def has_paywall_marker(text):
-    lower = text.lower()
-    for marker in PAYWALL_MARKERS:
-        if marker in lower:
-            return True
-    return False
+def _extract_bs4(raw: bytes) -> str:
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(raw, "html.parser")
+
+        # Remove noise tags
+        for tag in soup(["script", "style", "nav", "footer", "header",
+                         "aside", "form", "noscript", "iframe"]):
+            tag.decompose()
+
+        # Try to find main article body first
+        main = (
+            soup.find("article")
+            or soup.find("main")
+            or soup.find(class_=re.compile(r"article|post|content|body", re.I))
+            or soup.find(id=re.compile(r"article|post|content|body", re.I))
+            or soup.body
+        )
+        if main:
+            text = main.get_text(separator=" ", strip=True)
+        else:
+            text = soup.get_text(separator=" ", strip=True)
+
+        return re.sub(r"\s+", " ", text).strip()
+    except ImportError:
+        return ""
+    except Exception:
+        return ""
 
 
-def extract_text_bs4(html):
-    soup = BeautifulSoup(html, "html.parser")
-
-    # Remove noise
-    for tag in soup(["script", "style", "nav", "footer",
-                     "header", "aside", "form", "iframe",
-                     "noscript", "meta", "link"]):
-        tag.decompose()
-
-    # Try article body first
-    for selector in [
-        "article", "main",
-        '[class*="article-body"]',
-        '[class*="post-content"]',
-        '[class*="entry-content"]',
-        '[class*="story-body"]',
-        '[class*="article__body"]',
-        '[itemprop="articleBody"]',
-    ]:
-        el = soup.select_one(selector)
-        if el:
-            text = el.get_text(separator=" ", strip=True)
-            if len(text) > 200:
-                return text
-
-    # Fallback: full body text
-    return soup.get_text(separator=" ", strip=True)
+def _extract_regex(raw: bytes) -> str:
+    try:
+        html = raw.decode("utf-8", errors="ignore")
+        html = re.sub(r"<script[^>]*>.*?</script>", " ", html, flags=re.DOTALL | re.IGNORECASE)
+        html = re.sub(r"<style[^>]*>.*?</style>",   " ", html, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r"<[^>]+>", " ", html)
+        return re.sub(r"\s+", " ", text).strip()
+    except Exception:
+        return ""
 
 
-def extract_text_simple(html):
-    # Strip tags with regex if bs4 unavailable
-    text = re.sub(r"<[^>]+>", " ", html)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+def _extract_text(raw: bytes) -> str:
+    for extractor in (_extract_trafilatura, _extract_bs4, _extract_regex):
+        text = extractor(raw)
+        if text and len(text) > 200:
+            return text
+    return ""
 
 
-def clean_text(text, limit):
-    text = re.sub(r"\s+", " ", text).strip()
-    return text[:limit]
+def _is_paywall(text: str) -> bool:
+    sample = text[:600].lower()
+    return any(signal in sample for signal in _PAYWALL_SIGNALS)
+
+
+def _skip_url(url: str) -> bool:
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(url).netloc.lstrip("www.")
+        return any(host.endswith(d) for d in _SKIP_DOMAINS)
+    except Exception:
+        return False
 
 
 # ─────────────────────────────────────────────────────────────
-# MAIN SCRAPER
+# PUBLIC API
 # ─────────────────────────────────────────────────────────────
 
-def scrape_article(article):
+def scrape_article(article: dict) -> dict:
     """
-    Returns article dict with 'content' field populated.
-    Falls back to rss_summary if scraping fails/paywalled.
+    Fetch full article text from article["link"].
+    Mutates and returns the article dict with:
+        content  – full text (or RSS fallback)
+        scraped  – True if successfully scraped (not a paywall)
+        paywall  – True if paywall detected
     """
+    url          = (article.get("link") or "").strip()
+    rss_fallback = str(article.get("rss_summary") or "")[:RSS_FALLBACK_CHARS]
 
-    url     = article.get("link", "")
-    fallback = clean_text(
-        article.get("rss_summary", ""),
-        RSS_FALLBACK_CHARS
-    )
+    # Default: use RSS content
+    article["content"] = rss_fallback
+    article["scraped"]  = False
+    article["paywall"]  = False
 
-    if not url:
-        article["content"] = fallback
-        article["scraped"] = False
-        return article
-
-    if is_paywalled_domain(url):
-        print(f"  [SCRAPE] Paywall domain — using RSS: {url[:60]}")
-        article["content"] = fallback
-        article["scraped"] = False
-        article["paywall"] = True
+    if not url or _skip_url(url):
         return article
 
     try:
-        resp = requests.get(
+        r = requests.get(
             url,
-            headers=HEADERS,
             timeout=SCRAPE_TIMEOUT,
-            allow_redirects=True
+            headers=_HEADERS,
+            allow_redirects=True,
+            stream=False,
         )
 
-        if resp.status_code != 200:
-            article["content"] = fallback
-            article["scraped"] = False
+        if r.status_code not in (200, 203):
             return article
 
-        html = resp.text
+        text = _extract_text(r.content)
 
-        if has_paywall_marker(html):
-            print(f"  [SCRAPE] Paywall detected — using RSS: {url[:60]}")
-            article["content"] = fallback
-            article["scraped"] = False
+        if not text or len(text) < 150:
+            return article
+
+        if _is_paywall(text):
             article["paywall"] = True
+            # Keep RSS fallback for paywalled content
             return article
 
-        if BS4_OK:
-            raw = extract_text_bs4(html)
-        else:
-            raw = extract_text_simple(html)
+        article["content"] = text[:SCRAPE_MAX_CHARS]
+        article["scraped"]  = True
 
-        content = clean_text(raw, SCRAPE_MAX_CHARS)
-
-        if len(content) < 150:
-            # Too little extracted — use RSS
-            article["content"] = fallback
-            article["scraped"] = False
-        else:
-            article["content"] = content
-            article["scraped"] = True
-
-    except Exception as e:
-        print(f"  [SCRAPE] Error for {url[:60]}: {e}")
-        article["content"] = fallback
-        article["scraped"] = False
+    except requests.exceptions.Timeout:
+        pass   # RSS fallback already set
+    except requests.exceptions.TooManyRedirects:
+        pass
+    except requests.exceptions.ConnectionError:
+        pass
+    except Exception as exc:
+        print(f"  [SCRAPER] Unexpected error ({url[:60]}): {exc}")
 
     return article
-
-
-def scrape_batch(articles, delay=1.0):
-    """Scrape a list of articles with a small delay between requests."""
-    results = []
-    total   = len(articles)
-
-    for i, article in enumerate(articles, 1):
-        print(f"  [SCRAPE] {i}/{total} — {article['title'][:60]}")
-        article = scrape_article(article)
-        results.append(article)
-
-        import time
-        time.sleep(delay)
-
-    scraped_count = sum(1 for a in results if a.get("scraped"))
-    print(f"[SCRAPE] Done: {scraped_count}/{total} full articles, rest from RSS")
-    return results

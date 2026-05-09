@@ -1,389 +1,355 @@
 """
 scheduler.py
-Main orchestrator with fixed IST schedule:
-  - Daily summary + newsletter: 7:00 AM IST
-  - Cycle 1: 8:00 AM IST
-  - Cycle 2: 3:00 PM IST
-  - Cycle 3: 9:00 PM IST
+JARVIS main orchestrator — runs intelligence cycles and daily summary on schedule.
+
+Schedule (IST = UTC+5:30):
+  07:00 IST → Daily Summary + Newsletter  (DAILY_SUMMARY_HOUR from config)
+  08:00 IST → Cycle 1
+  15:00 IST → Cycle 2
+  21:00 IST → Cycle 3
+
+On first startup, a boot cycle runs 90 seconds after launch so you get
+fresh intelligence immediately without waiting for the next slot.
+
+NOTE: This file is launched as a subprocess by app.py.
+      It runs the bot polling loop (if webhook mode is not active)
+      and the scheduling loop in a single process.
 """
 
-import json
 import os
-import threading
+import sys
 import time
+import threading
+import traceback
 from datetime import datetime, timezone, timedelta
 
-import dailySummary
-from ai_router import ai_digest
-from archive_manager import archive_old_data
-from bot_listener import start_listener
-from collector import collect_all
-from config import DIGEST_STATE_FILE
-from dedupe import get_new_articles
-from internet_monitor import wait_for_internet
-from notifier import send_digest
-from queue_manager import (
-    add_batch,
-    clear_all,
-    clear_done,
-    reset_stuck,
-    stats as queue_stats,
-)
-from runtime_state import reset_processing_state, update_runtime_state
-from storage import save_digest
-from storage_backend import is_configured, pull_state, push_state
-from telemetry import print_stats, update as tele_update
-from worker_processor import run_worker
-
-
-TEST_MODE_DAILY = False
-TEST_MODE_WEEKLY = False
+# ─────────────────────────────────────────────────────────────
+# IST HELPERS
+# ─────────────────────────────────────────────────────────────
 
 IST = timezone(timedelta(hours=5, minutes=30))
-DAILY_SUMMARY_TIME = (7, 0)
+
+
+def now_ist() -> datetime:
+    return datetime.now(IST)
+
+
+def fmt_ist(dt: datetime = None) -> str:
+    if dt is None:
+        dt = now_ist()
+    return dt.strftime("%Y-%m-%d %H:%M IST")
+
+
+# ─────────────────────────────────────────────────────────────
+# SCHEDULE CONFIGURATION
+# ─────────────────────────────────────────────────────────────
+
+# (hour_IST, minute_IST, display_label)
 CYCLE_SLOTS = [
-    ("cycle_1", 8, 0),
-    ("cycle_2", 15, 0),
-    ("cycle_3", 21, 0),
+    (8,  0, "08:00 IST"),
+    (15, 0, "15:00 IST"),
+    (21, 0, "21:00 IST"),
 ]
 
-_daily_summary_lock = threading.Lock()
-_last_test_daily_run = [0.0]
+# Daily summary fires at this IST hour (overridable via DAILY_SUMMARY_HOUR env)
+_DAILY_HOUR = int(os.getenv("DAILY_SUMMARY_HOUR", "7"))
 
+# Window in minutes within which a slot is considered "due" (avoids
+# re-runs if scheduler restarts mid-window)
+_SLOT_WINDOW_MINS = 4
 
-def _load_state() -> dict:
-    if not os.path.exists(DIGEST_STATE_FILE):
-        return {
-            "cycle_num": 0,
-            "last_daily_date": "",
-            "last_cycle_at": "",
-            "last_cycle_slot": "",
-        }
+# ─────────────────────────────────────────────────────────────
+# RUNTIME STATE HELPERS
+# ─────────────────────────────────────────────────────────────
+
+def _update_state(**kwargs):
     try:
-        with open(DIGEST_STATE_FILE, encoding="utf-8") as f:
-            data = json.load(f)
-        if "last_cycle_slot" not in data:
-            data["last_cycle_slot"] = ""
-        if not data.get("last_cycle_slot") and data.get("last_cycle_at"):
-            inferred = _infer_slot_from_last_cycle_at(data.get("last_cycle_at", ""))
-            if inferred:
-                data["last_cycle_slot"] = inferred
-        return data
-    except Exception:
-        return {
-            "cycle_num": 0,
-            "last_daily_date": "",
-            "last_cycle_at": "",
-            "last_cycle_slot": "",
-        }
+        from runtime_state import update_runtime_state
+        update_runtime_state(**kwargs)
+    except Exception as e:
+        print(f"[SCHED] runtime_state update error: {e}")
 
 
-def _infer_slot_from_last_cycle_at(last_cycle_at: str) -> str:
-    try:
-        dt_utc = datetime.fromisoformat(last_cycle_at)
-        if dt_utc.tzinfo is None:
-            dt_utc = dt_utc.replace(tzinfo=timezone.utc)
-        dt_ist = dt_utc.astimezone(IST)
-        chosen = None
-        for slot_name, hour, minute in CYCLE_SLOTS:
-            slot_dt = _slot_datetime(dt_ist.date(), hour, minute)
-            if dt_ist >= slot_dt:
-                chosen = _slot_id(dt_ist, slot_name)
-        return chosen or ""
-    except Exception:
-        return ""
+# ─────────────────────────────────────────────────────────────
+# NEXT-SLOT CALCULATOR
+# ─────────────────────────────────────────────────────────────
+
+def _next_cycle_dt() -> datetime:
+    """Return the datetime of the very next scheduled cycle slot."""
+    now = now_ist()
+    for h, m, _ in CYCLE_SLOTS:
+        candidate = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        if candidate > now:
+            return candidate
+    # All slots passed today — first slot tomorrow
+    tomorrow = now + timedelta(days=1)
+    h, m, _ = CYCLE_SLOTS[0]
+    return tomorrow.replace(hour=h, minute=m, second=0, microsecond=0)
 
 
-def _save_state(state: dict):
-    with open(DIGEST_STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2)
+# ─────────────────────────────────────────────────────────────
+# INTELLIGENCE CYCLE
+# ─────────────────────────────────────────────────────────────
+
+_cycle_counter = 0
+_cycle_lock    = threading.Lock()   # prevent overlapping cycles
 
 
-def _slot_id(now_ist: datetime, slot_name: str) -> str:
-    return f"{now_ist.strftime('%Y-%m-%d')}::{slot_name}"
+def run_cycle(slot_label: str, boot_cycle: bool = False):
+    """
+    Full intelligence cycle:
+      collect → dedupe → queue → worker (AI + save) → digest → push HF.
+    """
+    global _cycle_counter
 
+    with _cycle_lock:
+        _cycle_counter += 1
+        cycle_num = _cycle_counter
 
-def _slot_datetime(base_date, hour, minute):
-    return datetime(
-        year=base_date.year,
-        month=base_date.month,
-        day=base_date.day,
-        hour=hour,
-        minute=minute,
-        second=0,
-        microsecond=0,
-        tzinfo=IST,
-    )
+    prefix = "[BOOT-CYCLE]" if boot_cycle else f"[CYCLE {cycle_num}]"
+    print(f"\n{'='*60}")
+    print(f"{prefix} Starting — {slot_label}")
+    print(f"{prefix} IST: {fmt_ist()}")
+    print(f"{'='*60}\n")
 
-
-def _next_cycle_info(now_ist: datetime | None = None):
-    now_ist = now_ist or datetime.now(IST)
-    today = now_ist.date()
-    candidates = []
-
-    for slot_name, hour, minute in CYCLE_SLOTS:
-        slot_dt = _slot_datetime(today, hour, minute)
-        candidates.append((slot_name, slot_dt))
-
-    tomorrow = today + timedelta(days=1)
-    for slot_name, hour, minute in CYCLE_SLOTS:
-        slot_dt = _slot_datetime(tomorrow, hour, minute)
-        candidates.append((slot_name, slot_dt))
-
-    for slot_name, slot_dt in candidates:
-        if slot_dt > now_ist:
-            return slot_name, slot_dt
-    return candidates[-1]
-
-
-def _due_cycle_slot(now_ist: datetime | None = None):
-    now_ist = now_ist or datetime.now(IST)
-    state = _load_state()
-    today = now_ist.date()
-
-    for slot_name, hour, minute in reversed(CYCLE_SLOTS):
-        slot_dt = _slot_datetime(today, hour, minute)
-        if now_ist >= slot_dt:
-            current_slot_id = _slot_id(now_ist, slot_name)
-            if state.get("last_cycle_slot") != current_slot_id:
-                return slot_name, slot_dt, current_slot_id
-            return None
-    return None
-
-
-def _should_run_daily(now_ist: datetime | None = None) -> bool:
-    now_ist = now_ist or datetime.now(IST)
-
-    if TEST_MODE_DAILY or TEST_MODE_WEEKLY:
-        now = time.time()
-        if now - _last_test_daily_run[0] < 1800:
-            return False
-        print("[SCHEDULER] TEST MODE: Triggering Daily/Weekly Summary")
-        _last_test_daily_run[0] = now
-        return True
-
-    state = _load_state()
-    today_ist = now_ist.strftime("%Y-%m-%d")
-    if state.get("last_daily_date") == today_ist:
-        return False
-
-    target = _slot_datetime(now_ist.date(), DAILY_SUMMARY_TIME[0], DAILY_SUMMARY_TIME[1])
-    return now_ist >= target
-
-
-def _run_daily_summary_if_due():
-    now_ist = datetime.now(IST)
-    if not _should_run_daily(now_ist):
-        return
-    if not _daily_summary_lock.acquire(blocking=False):
-        return
-
-    try:
-        print("\n[JARVIS] Running 7:00 AM IST daily summary + newsletter pipeline...")
-        update_runtime_state(
-            phase="daily_summary",
-            last_daily_run_ist=now_ist.strftime("%Y-%m-%d %H:%M:%S IST"),
-        )
-        dailySummary.FORCE_TEST_WEEKLY = TEST_MODE_WEEKLY
-        dailySummary.run_daily_summary()
-
-        if not TEST_MODE_DAILY and not TEST_MODE_WEEKLY:
-            state = _load_state()
-            state["last_daily_date"] = now_ist.strftime("%Y-%m-%d")
-            _save_state(state)
-            if is_configured():
-                push_state(new_articles=[])
-    finally:
-        reset_processing_state()
-        _daily_summary_lock.release()
-
-
-def _daily_timer_loop():
-    print("[SCHEDULER] Daily timer thread active; checking every 30s for 7:00 AM IST")
-    while True:
-        try:
-            _run_daily_summary_if_due()
-        except Exception as e:
-            print(f"[SCHEDULER] Daily timer error: {e}")
-        time.sleep(30)
-
-
-def _update_next_cycle_runtime():
-    slot_name, slot_dt = _next_cycle_info()
-    update_runtime_state(
-        next_cycle_at_ist=slot_dt.strftime("%Y-%m-%d %H:%M:%S IST"),
-        phase=update_runtime_phase(),
-    )
-    return slot_name, slot_dt
-
-
-def update_runtime_phase():
-    try:
-        from runtime_state import load_runtime_state
-        current = load_runtime_state()
-        return current.get("phase", "idle")
-    except Exception:
-        return "idle"
-
-
-def run_cycle(slot_name: str, slot_dt: datetime, slot_id: str):
-    state = _load_state()
-    cycle_num = state["cycle_num"] + 1
-    now_utc = datetime.now(timezone.utc).isoformat()
-    slot_label = slot_name.replace("_", " ").title()
-
-    print(f"\n{'=' * 60}")
-    print(f"[SCHEDULER] {slot_label} starting at scheduled IST slot {slot_dt.strftime('%Y-%m-%d %H:%M:%S IST')}")
-    print(f"[SCHEDULER] Global cycle number: {cycle_num} | UTC start: {now_utc}")
-    print(f"{'=' * 60}\n")
-
-    update_runtime_state(
-        phase="cycle_starting",
+    _update_state(
+        phase="collecting",
         current_cycle_number=cycle_num,
-        current_cycle_slot=slot_name,
-        current_cycle_date_ist=slot_dt.strftime("%Y-%m-%d"),
-        last_cycle_started_at=now_utc,
-        queue_total=0,
-        queue_done=0,
-        queue_failed=0,
-        current_item_title="",
+        current_cycle_slot=slot_label,
     )
 
-    tele_update("cycle_start")
-    wait_for_internet()
+    processed_items = []
 
-    clear_all()
-    reset_stuck()
-    from dedupe import reset_cache
+    try:
+        # 1. Wait for internet
+        from internet_monitor import wait_for_internet
+        wait_for_internet()
 
-    reset_cache()
+        # 2. Pull HF state
+        try:
+            from storage_backend import is_configured, pull_state
+            if is_configured():
+                pull_state()
+        except Exception as e:
+            print(f"{prefix} HF pull warning: {e}")
 
-    update_runtime_state(phase="collecting")
-    print("[CYCLE] Collecting RSS sources...")
-    raw_articles = collect_all()
-    print(f"[CYCLE] Collected: {len(raw_articles)} total")
+        # 3. Telemetry
+        from telemetry import update as tele_update
+        tele_update("cycle_start")
 
-    update_runtime_state(phase="deduplicating")
-    new_articles = get_new_articles(raw_articles)
-    print(f"[CYCLE] New after dedup: {len(new_articles)}")
+        # 4. Reset dedupe cache (fresh load from disk)
+        from dedupe import reset_cache
+        reset_cache()
 
-    if not new_articles:
-        print("[CYCLE] No new articles in this slot")
-        state["cycle_num"] = cycle_num
-        state["last_cycle_at"] = datetime.now(timezone.utc).isoformat()
-        state["last_cycle_slot"] = slot_id
-        _save_state(state)
-        update_runtime_state(
+        # 5. Clear in-memory queue
+        from queue_manager import clear_all, add_batch, reset_stuck
+        clear_all()
+
+        # 6. Collect RSS
+        _update_state(phase="collecting")
+        from collector import collect_all
+        raw = collect_all(limit_per_source=40)
+        print(f"{prefix} Collected {len(raw)} articles from RSS")
+
+        # 7. Deduplicate
+        from dedupe import get_new_articles
+        new_articles = get_new_articles(raw)
+        print(f"{prefix} {len(new_articles)} new after dedup")
+
+        if not new_articles:
+            print(f"{prefix} No new articles — skipping processing")
+            _update_state(phase="idle")
+            return
+
+        # 8. Enqueue
+        add_batch(new_articles)
+        reset_stuck()
+
+        # 9. Worker: AI analysis + save
+        _update_state(phase="processing", queue_total=len(new_articles), queue_done=0, queue_failed=0)
+        from worker_processor import run_worker
+        processed_items, failed_items = run_worker()
+        print(f"{prefix} Processed: {len(processed_items)} | Failed: {len(failed_items)}")
+
+        # 10. AI digest
+        _update_state(phase="digesting")
+        ai_digest_data = None
+        if processed_items:
+            try:
+                from ai_router import ai_digest
+                ai_digest_data = ai_digest(processed_items, slot_label)
+            except Exception as e:
+                print(f"{prefix} AI digest error: {e}")
+
+        # 11. Save digest for morning daily-summary
+        if ai_digest_data:
+            try:
+                from storage import save_digest
+                save_digest(ai_digest_data, cycle_num)
+            except Exception as e:
+                print(f"{prefix} Digest save error: {e}")
+
+        # 12. Send Telegram digest
+        try:
+            from notifier import send_digest
+            send_digest(processed_items, cycle_num, ai_digest_data)
+        except Exception as e:
+            print(f"{prefix} Telegram send error: {e}")
+
+        # 13. Archive old data
+        try:
+            from archive_manager import archive_old_data
+            archive_old_data(days=3)
+        except Exception as e:
+            print(f"{prefix} Archive error: {e}")
+
+        # 14. Push to HF Dataset
+        _update_state(phase="syncing")
+        try:
+            from storage_backend import is_configured, push_state
+            if is_configured():
+                push_state(new_articles=processed_items)
+                print(f"{prefix} HF state synced")
+        except Exception as e:
+            print(f"{prefix} HF push error: {e}")
+
+    except Exception as e:
+        print(f"{prefix} ⚠️ Cycle error: {e}")
+        traceback.print_exc()
+
+    finally:
+        next_dt = _next_cycle_dt()
+        _update_state(
             phase="idle",
-            last_cycle_finished_at=state["last_cycle_at"],
-            queue_total=0,
-            queue_done=0,
-            queue_failed=0,
+            next_cycle_at_ist=fmt_ist(next_dt),
         )
-        if is_configured():
-            push_state(new_articles=[])
+        print(f"\n{prefix} Done — next cycle at {fmt_ist(next_dt)}\n")
+
+
+# ─────────────────────────────────────────────────────────────
+# DAILY SUMMARY
+# ─────────────────────────────────────────────────────────────
+
+def run_daily():
+    print(f"\n{'='*60}")
+    print(f"[DAILY] Starting Daily Summary")
+    print(f"[DAILY] IST: {fmt_ist()}")
+    print(f"{'='*60}\n")
+
+    _update_state(phase="daily_summary")
+    try:
+        from dailySummary import run_daily_summary
+        run_daily_summary()
+        _update_state(last_daily_run_ist=fmt_ist())
+        print("[DAILY] Complete")
+    except Exception as e:
+        print(f"[DAILY] Error: {e}")
+        traceback.print_exc()
+    finally:
+        _update_state(phase="idle")
+
+
+# ─────────────────────────────────────────────────────────────
+# BOOT CYCLE — runs once ~90 s after startup
+# ─────────────────────────────────────────────────────────────
+
+def _boot_cycle_thread():
+    """
+    Runs one cycle shortly after startup so we get fresh intelligence
+    immediately rather than waiting for the next scheduled slot.
+    Skipped if a scheduled slot fires within 10 minutes.
+    """
+    delay = 90   # seconds
+    print(f"[SCHED] Boot cycle scheduled in {delay}s")
+    time.sleep(delay)
+
+    # Check if a scheduled slot is within ±10 minutes
+    now = now_ist()
+    for h, m, _ in CYCLE_SLOTS:
+        slot = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        if abs((slot - now).total_seconds()) < 600:
+            print("[SCHED] Boot cycle skipped — scheduled slot is imminent")
+            return
+
+    # Also skip if daily summary is imminent
+    daily_slot = now.replace(hour=_DAILY_HOUR, minute=0, second=0, microsecond=0)
+    if abs((daily_slot - now).total_seconds()) < 600:
+        print("[SCHED] Boot cycle skipped — daily summary is imminent")
         return
 
-    update_runtime_state(phase="queueing", queue_total=len(new_articles), queue_done=0, queue_failed=0)
-    add_batch(new_articles)
-    print(f"[CYCLE] Queue stats: {queue_stats()}")
+    run_cycle("Boot", boot_cycle=True)
 
-    update_runtime_state(phase="processing")
-    processed_items, failed_items = run_worker()
 
-    digest_data = None
-    if processed_items:
-        update_runtime_state(phase="digest_generation")
-        print(f"[CYCLE] Generating AI 8-hour summary for {slot_name}...")
-        digest_data = ai_digest(processed_items, f"{slot_label} ({slot_dt.strftime('%d %b %Y')})")
-        if digest_data:
-            save_digest(digest_data, cycle_num)
-            print("[CYCLE] Digest saved")
-        else:
-            print("[CYCLE] AI digest failed; continuing with raw digest send")
+# ─────────────────────────────────────────────────────────────
+# MAIN SCHEDULING LOOP
+# ─────────────────────────────────────────────────────────────
 
-    update_runtime_state(phase="telegram_digest")
-    send_digest(processed_items, cycle_num, digest_data)
+def main():
+    print("\n[SCHED] ====== JARVIS Scheduler Starting ======")
+    print(f"[SCHED] IST: {fmt_ist()}")
 
-    clear_done()
-    archive_old_data(days=3)
-    print_stats()
+    # ── Start bot listener (polling or webhook mode based on env) ──
+    try:
+        from bot_listener import start_listener
+        start_listener()
+    except Exception as e:
+        print(f"[SCHED] Bot listener failed to start: {e}")
+        traceback.print_exc()
 
-    state["cycle_num"] = cycle_num
-    state["last_cycle_at"] = datetime.now(timezone.utc).isoformat()
-    state["last_cycle_slot"] = slot_id
-    _save_state(state)
-
-    update_runtime_state(
-        phase="syncing",
-        last_cycle_finished_at=state["last_cycle_at"],
-        queue_total=len(processed_items) + len(failed_items),
-        queue_done=len(processed_items),
-        queue_failed=len(failed_items),
-    )
-
-    if is_configured():
-        print("[CYCLE] Syncing state to HF Dataset...")
-        push_state(new_articles=processed_items)
-    else:
-        print("[CYCLE] HF persistence not configured")
-
-    print(f"\n[CYCLE] {slot_name} complete: processed={len(processed_items)} failed={len(failed_items)}")
-    next_slot_name, next_slot_dt = _next_cycle_info()
-    print(f"[SCHEDULER] Next cycle scheduled: {next_slot_name} at {next_slot_dt.strftime('%Y-%m-%d %H:%M:%S IST')}")
-    update_runtime_state(
+    # ── Initial runtime state ──
+    _update_state(
         phase="idle",
-        next_cycle_at_ist=next_slot_dt.strftime("%Y-%m-%d %H:%M:%S IST"),
-        current_item_title="",
+        current_cycle_number=0,
+        current_cycle_slot=None,
+        next_cycle_at_ist=fmt_ist(_next_cycle_dt()),
     )
 
+    # ── Boot cycle (runs once after short delay) ──
+    threading.Thread(target=_boot_cycle_thread, daemon=True).start()
 
-def start_scheduler():
-    print("\n" + "=" * 60)
-    print(" JARVIS Intelligence System — Fixed IST Schedule")
-    print(" Daily summary/newsletter : 07:00 AM IST")
-    print(" Cycle 1                 : 08:00 AM IST")
-    print(" Cycle 2                 : 03:00 PM IST")
-    print(" Cycle 3                 : 09:00 PM IST")
-    print(f" HF Persistence          : {'Enabled' if is_configured() else 'Disabled'}")
-    print("=" * 60 + "\n")
+    print(f"[SCHED] Cycle slots (IST): {[s[2] for s in CYCLE_SLOTS]}")
+    print(f"[SCHED] Daily summary hour: {_DAILY_HOUR:02d}:00 IST")
+    print(f"[SCHED] Next cycle: {fmt_ist(_next_cycle_dt())}")
+    print("[SCHED] Scheduling loop active\n")
 
-    if is_configured():
-        print("[JARVIS] Restoring state from HF Dataset...")
-        pull_state()
-
-    reset_processing_state()
-    _, next_slot_dt = _next_cycle_info()
-    update_runtime_state(next_cycle_at_ist=next_slot_dt.strftime("%Y-%m-%d %H:%M:%S IST"))
-
-    start_listener()
-    threading.Thread(target=_daily_timer_loop, daemon=True).start()
+    # Track which slots already ran today (key = "YYYY-MM-DD-HH")
+    ran_slots: set[str] = set()
 
     while True:
         try:
-            due = _due_cycle_slot()
-            if due:
-                slot_name, slot_dt, slot_id = due
-                run_cycle(slot_name, slot_dt, slot_id)
-            else:
-                next_slot_name, next_slot_dt = _next_cycle_info()
-                update_runtime_state(next_cycle_at_ist=next_slot_dt.strftime("%Y-%m-%d %H:%M:%S IST"))
-                now_ist = datetime.now(IST)
-                seconds = max(15, int((next_slot_dt - now_ist).total_seconds()))
-                minutes = seconds // 60
-                print(f"[SCHEDULER] Idle. Next cycle: {next_slot_name} at {next_slot_dt.strftime('%Y-%m-%d %H:%M:%S IST')} ({minutes}m away)")
-                time.sleep(min(300, seconds))
+            now      = now_ist()
+            date_str = now.strftime("%Y-%m-%d")
+            h, m     = now.hour, now.minute
 
-        except KeyboardInterrupt:
-            print("\n[JARVIS] Stopped by user.")
-            break
+            # ── Daily summary check ──
+            daily_key = f"{date_str}-daily"
+            if h == _DAILY_HOUR and 0 <= m < _SLOT_WINDOW_MINS and daily_key not in ran_slots:
+                ran_slots.add(daily_key)
+                threading.Thread(target=run_daily, daemon=False).start()
+
+            # ── Cycle slot checks ──
+            for slot_h, slot_m, slot_label in CYCLE_SLOTS:
+                slot_key = f"{date_str}-{slot_h:02d}"
+                if h == slot_h and 0 <= m < _SLOT_WINDOW_MINS and slot_key not in ran_slots:
+                    ran_slots.add(slot_key)
+                    # Run cycle in a thread (daemon=False keeps process alive while running)
+                    threading.Thread(
+                        target=run_cycle,
+                        args=(slot_label,),
+                        kwargs={"boot_cycle": False},
+                        daemon=False,
+                    ).start()
+                    break   # Only start one cycle per check
+
+            # ── Prune old keys (keep today's + yesterday's keys) ──
+            yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+            ran_slots = {k for k in ran_slots if k.startswith(date_str) or k.startswith(yesterday)}
+
         except Exception as e:
-            print(f"\n[JARVIS] Scheduler error: {e}")
-            import traceback
+            print(f"[SCHED] Loop error: {e}")
 
-            traceback.print_exc()
-            time.sleep(30)
+        time.sleep(30)   # Check every 30 seconds
 
 
 if __name__ == "__main__":
-    start_scheduler()
+    main()
