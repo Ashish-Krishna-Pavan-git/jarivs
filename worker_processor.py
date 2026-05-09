@@ -1,11 +1,11 @@
 """
 worker_processor.py
 Core processing engine.
-Handles AI response normalization (category/summary type safety).
-Includes strict crash-prevention for bad AI formatting.
+Handles AI analysis, normalization, saving, and immediate alerts.
 """
 
 import time
+import traceback
 
 from queue_manager  import get_next_item, mark_done, mark_failed, get_pending_count
 from ai_router      import ai_analyze
@@ -18,107 +18,102 @@ from config         import IMMEDIATE_ALERT_LEVELS
 
 
 # ─────────────────────────────────────────────────────────────
-# DATA NORMALIZERS (CRASH-PROOFED)
+# NORMALIZERS
 # ─────────────────────────────────────────────────────────────
 
-def normalize_category(cat):
-    """Ensure category is always a plain string."""
+def normalize_category(cat) -> str:
     try:
         if isinstance(cat, list):
             return str(cat[0]).lower().strip() if cat else "tech"
         if isinstance(cat, str):
             return cat.lower().strip()
         return "tech"
-    except:
+    except Exception:
         return "tech"
 
 
-def normalize_summary(summary):
-    """
-    Ensure summary is always a list of plain strings.
-    AI sometimes returns list of dicts, a raw string, or broken JSON.
-    """
+def normalize_summary(summary) -> list:
     try:
         if isinstance(summary, str):
             return [summary] if summary.strip() else ["No summary available"]
-
         if isinstance(summary, list):
-            clean =[]
+            clean = []
             for item in summary:
                 if isinstance(item, str) and item.strip():
                     clean.append(item.strip())
                 elif isinstance(item, dict):
-                    # Extract any string value from the dict
                     for v in item.values():
                         if isinstance(v, str) and v.strip():
                             clean.append(v.strip())
                             break
             return clean if clean else ["No summary available"]
-
         return ["No summary available"]
-    except:
-        return ["AI summary parsing failed — raw text used."]
+    except Exception:
+        return ["Summary parsing failed"]
 
 
-def normalize_list_field(val):
-    """Normalize tags/cves/actors — always return list of strings."""
+def normalize_list_field(val) -> list:
     try:
         if not val:
-            return[]
+            return []
         if isinstance(val, str):
-            return [val] if val.strip() else[]
+            return [val] if val.strip() else []
         if isinstance(val, list):
             return [str(x).strip() for x in val if x and str(x).strip()]
-        return[]
-    except:
-        return[]
+        return []
+    except Exception:
+        return []
 
 
-def is_dead_serious(item):
-    """Smart filter to prevent alert spam. Only triggers on drop-everything events."""
+# ─────────────────────────────────────────────────────────────
+# SMART ALERT FILTER
+# ─────────────────────────────────────────────────────────────
+
+def is_dead_serious(item: dict) -> bool:
+    """
+    Returns True only for drop-everything events that warrant immediate alert.
+    Prevents alert spam from borderline articles.
+    """
     try:
         severity = item.get("severity", "LOW")
         if severity not in ("CRITICAL", "HIGH"):
             return False
-            
+
         try:
             confidence = int(item.get("confidence", 5))
-        except:
+        except Exception:
             confidence = 5
-            
-        # Ignore low-confidence AI classifications to prevent false alarms
+
         if confidence < 7:
             return False
-            
+
         text = (str(item.get("title", "")) + " " + str(item.get("summary_text", ""))).lower()
 
-        # Ignore retrospective or historical articles
-        ignore_keywords =[
-            "retrospective", "history of", "years ago", "look back", 
-            "news events that shaped", "decade", "evolution of"
+        # Ignore historical/retrospective articles
+        ignore_kw = [
+            "retrospective", "history of", "years ago", "look back",
+            "news events that shaped", "decade", "evolution of",
+            "a timeline of", "how it happened",
         ]
-        if any(ik in text for ik in ignore_keywords):
+        if any(k in text for k in ignore_kw):
             return False
-        
-        # Keywords that imply immediate real-world danger
-        urgent_keywords =[
+
+        # Keywords that indicate real-time danger
+        urgent_kw = [
             "zero-day", "0-day", "actively exploited", "in the wild",
-            "mass exploitation", "unauthenticated rce", "emergency patch"
+            "mass exploitation", "unauthenticated rce", "emergency patch",
+            "immediate", "critical patch tuesday",
         ]
-        
-        has_urgent = any(kw in text for kw in urgent_keywords)
-        
-        # Condition 1: It's CRITICAL, and either mentions active exploits OR has CVEs with high confidence
+        has_urgent = any(k in text for k in urgent_kw)
+
         if severity == "CRITICAL" and (has_urgent or (item.get("cves") and confidence >= 8)):
             return True
-            
-        # Condition 2: It's HIGH, but explicitly mentions active exploitation and AI is confident
         if severity == "HIGH" and has_urgent and confidence >= 8:
             return True
-            
+
         return False
     except Exception as e:
-        print(f"  [PROC] Error in dead_serious filter: {e}")
+        print(f"  [PROC] Alert filter error: {e}")
         return False
 
 
@@ -126,12 +121,12 @@ def is_dead_serious(item):
 # PROCESS ONE ITEM
 # ─────────────────────────────────────────────────────────────
 
-def process_item(item):
+def process_item(item: dict) -> dict:
     article = item.get("article", {})
     title   = str(article.get("title", "Unknown Title"))
 
     print(f"\n  [PROC] {title[:70]}")
-    print(f"  [PROC] Source: {article.get('source','?')}")
+    print(f"  [PROC] Source: {article.get('source', '?')}")
 
     # ── 1. Scrape full content ──
     article = scrape_article(article)
@@ -143,33 +138,32 @@ def process_item(item):
     else:
         print(f"  [PROC] RSS fallback: {len(content)} chars")
 
-    # ── 2. AI analysis ──
+    # ── 2. AI analysis (all articles) ──
     print(f"  [PROC] Running AI analysis...")
     ai_data = ai_analyze(title, content)
-    
-    # Failsafe if AI returns nothing at all
+
     if not ai_data or not isinstance(ai_data, dict):
         ai_data = {
-            "severity": "LOW",
-            "category": "tech",
-            "summary":["AI analysis completely failed."],
+            "severity":  "LOW",
+            "category":  "tech",
+            "summary":   ["AI analysis completely failed."],
+            "confidence": 1,
         }
 
-    # ── 3. Normalize AI output (type safety) ──
+    # ── 3. Normalize AI output ──
     severity = str(ai_data.get("severity", "LOW")).upper()
     category = normalize_category(ai_data.get("category", "tech"))
     summary  = normalize_summary(ai_data.get("summary", []))
-    tags     = normalize_list_field(ai_data.get("tags",[]))
-    cves     = normalize_list_field(ai_data.get("cves",[]))
-    actors   = normalize_list_field(ai_data.get("actors",[]))
-    affected = normalize_list_field(ai_data.get("affected_products",[]))
-    
+    tags     = normalize_list_field(ai_data.get("tags", []))
+    cves     = normalize_list_field(ai_data.get("cves", []))
+    actors   = normalize_list_field(ai_data.get("actors", []))
+    affected = normalize_list_field(ai_data.get("affected_products", []))
+
     try:
         confidence = int(ai_data.get("confidence", 1))
-    except:
+    except Exception:
         confidence = 1
 
-    # Summary as plain text for Telegram
     summary_text = "\n".join(f"• {s}" for s in summary)
 
     # ── 4. Build processed record ──
@@ -180,8 +174,8 @@ def process_item(item):
         "severity":          severity,
         "category":          category,
         "confidence":        confidence,
-        "summary":           summary,           # list of strings
-        "summary_text":      summary_text,      # plain text for Telegram
+        "summary":           summary,
+        "summary_text":      summary_text,
         "tags":              tags,
         "cves":              cves,
         "actors":            actors,
@@ -192,18 +186,18 @@ def process_item(item):
         "timestamp":         int(time.time()),
     }
 
-    print(f"  [PROC] Severity: {severity} | Category: {category}")
+    print(f"  [PROC] ✓ {severity} | {category} | confidence={confidence}")
 
-    # ── 5. Save (ALL severities) ──
+    # ── 5. Save to disk ──
     save_article(processed)
     tele_update("processed", severity=severity)
 
-    # ── 6. Immediate alert ONLY for DEAD SERIOUS items ──
+    # ── 6. Immediate alert for genuinely critical events ──
     if is_dead_serious(processed):
-        print(f"  [PROC] 🚨 DEAD SERIOUS EVENT DETECTED — Sending Immediate Alert")
-        notify_immediate(processed)
+        print(f"  [PROC] 🚨 DEAD SERIOUS — sending immediate alert")
+        notify_immediate(processed)   # Non-blocking (background thread)
     elif severity in IMMEDIATE_ALERT_LEVELS:
-        print(f"  [PROC] Alert suppressed to prevent spam (will appear in 8hr digest).")
+        print(f"  [PROC] {severity} — will appear in 8hr digest (cooldown active or not urgent enough)")
 
     return processed
 
@@ -213,17 +207,17 @@ def process_item(item):
 # ─────────────────────────────────────────────────────────────
 
 def run_worker():
-    print("\n[WORKER] Starting...\n")
+    print("\n[WORKER] Starting queue drain...\n")
 
     processed_all = []
-    failed_all    =[]
+    failed_all    = []
     total         = get_pending_count()
     done          = 0
 
     while True:
         item = get_next_item()
         if not item:
-            print("\n[WORKER] Queue empty — done")
+            print(f"\n[WORKER] Queue empty — done")
             break
 
         done += 1
@@ -237,14 +231,13 @@ def run_worker():
             mark_as_seen([article])
 
         except Exception as e:
-            print(f"[WORKER] FATAL ERROR on item: {e}")
-            import traceback
+            print(f"[WORKER] ⚠️ Error on item: {e}")
             traceback.print_exc()
             tele_update("failed")
             mark_failed(item["id"])
             failed_all.append(item)
 
-        time.sleep(1)
+        time.sleep(0.5)   # Small gap between articles (rate limiter handles AI waits)
 
-    print(f"\n[WORKER] Complete: {len(processed_all)} processed, {len(failed_all)} failed")
+    print(f"\n[WORKER] ✓ Complete: {len(processed_all)} processed, {len(failed_all)} failed")
     return processed_all, failed_all
