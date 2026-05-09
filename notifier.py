@@ -11,13 +11,13 @@ FIXES vs original:
 """
 
 import time
-import json
 import os
 import threading
 import requests
 import difflib
 
 from config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+from subscriber_store import load_subscribers, save_subscribers
 
 MAX_MSG       = 4000
 SEND_TIMEOUT  = 60        # seconds — was 20, too short for HF egress
@@ -38,14 +38,11 @@ SEV_EMOJI = {
 # ─────────────────────────────────────────────────────────────
 
 def _get_subscribers():
-    subs_file = os.path.join("data", "subscribers.json")
-    if os.path.exists(subs_file):
-        try:
-            with open(subs_file) as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return [str(TELEGRAM_CHAT_ID)] if TELEGRAM_CHAT_ID else []
+    try:
+        subs = load_subscribers()
+        return sorted(subs)
+    except Exception:
+        return [str(TELEGRAM_CHAT_ID)] if TELEGRAM_CHAT_ID else []
 
 
 # ─────────────────────────────────────────────────────────────
@@ -87,6 +84,10 @@ def _send_one(chat_id: str, text: str) -> bool:
             elif r.status_code in (400, 403):
                 # Bad chat_id or bot blocked — don't retry
                 print(f"[NOTIFIER] Permanent error {r.status_code} for {chat_id}")
+                subscribers = load_subscribers()
+                if str(chat_id) in subscribers:
+                    subscribers.discard(str(chat_id))
+                    save_subscribers(subscribers)
                 return False
             else:
                 wait = 2 ** attempt

@@ -1,98 +1,322 @@
 """
 ai_router.py
-Smart dual-API routing:
+Task-aware Groq/Gemini routing with persisted quota/cooldown state.
 
-  PER-ARTICLE ANALYSIS  → Groq PRIMARY  → Gemini fallback
-  DIGEST / DAILY / WEEKLY → Gemini PRIMARY → Groq-70b fallback
-  DEEPDIVE / QUIZ (text)  → Gemini PRIMARY → Groq-70b fallback
+Routing policy:
+  - Bulk article analysis: Groq first, Gemini fallback only if needed.
+  - Scheduled synthesis (8h digest, daily, weekly): Gemini 2.5 first.
+  - Interactive bot tasks: Groq first to preserve Gemini budget.
 
-Why this split:
-  - Groq llama-3.1-8b: 30 RPM free, ~2s latency → perfect for bulk article analysis
-  - Gemini 2.5 Flash: 15 RPM free, better reasoning → saved for low-volume synthesis
-  - Result: 440 articles processed in ~25 min instead of 53 hours
+Provider usage and cooldowns are persisted in provider_state.json so a redeploy
+does not immediately forget quota exhaustion or hammer Gemini again.
 """
 
+import copy
 import json
-import time
 import os
 import random
 import threading
+import time
 
-from google import genai
-from google.genai import types
-from groq import Groq
+try:
+    from google import genai
+    from google.genai import types
+except ImportError:
+    genai = None
+    types = None
+
+try:
+    from groq import Groq
+except ImportError:
+    Groq = None
 
 from config import (
     AI_MAX_CONTENT_CHARS,
     GEMINI_MIN_INTERVAL,
     GROQ_MIN_INTERVAL,
+    GEMINI_SYNTHESIS_MODEL,
+    GEMINI_FALLBACK_MODEL,
+    GROQ_ARTICLE_MODEL,
+    GROQ_ARTICLE_FALLBACK_MODEL,
+    GROQ_SYNTHESIS_MODEL,
+    GROQ_TEXT_MODEL,
+    GEMINI_SYNTHESIS_HOURLY_LIMIT,
+    GEMINI_SYNTHESIS_DAILY_LIMIT,
+    GEMINI_SYNTHESIS_WEEKLY_LIMIT,
+    GEMINI_GENERAL_HOURLY_LIMIT,
+    GEMINI_GENERAL_DAILY_LIMIT,
+    GEMINI_COOLDOWN_429_SECONDS,
+    GEMINI_COOLDOWN_DAILY_SECONDS,
+    GROQ_HOURLY_LIMIT,
+    GROQ_DAILY_LIMIT,
+    GROQ_COOLDOWN_429_SECONDS,
+    PROVIDER_STATE_FILE,
 )
 
-# ─────────────────────────────────────────────────────────────
-# CLIENT SETUP
-# ─────────────────────────────────────────────────────────────
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GROQ_API_KEY   = os.getenv("GROQ_API_KEY", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
-gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
-groq_client   = Groq(api_key=GROQ_API_KEY)           if GROQ_API_KEY   else None
-
-
-# ─────────────────────────────────────────────────────────────
-# THREAD-SAFE PER-API RATE LIMITERS
-# (Bot listener thread uses Gemini/Groq too — separate locks prevent deadlock)
-# ─────────────────────────────────────────────────────────────
+gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY and genai else None
+groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY and Groq else None
 
 _gemini_lock = threading.Lock()
-_gemini_last = [0.0]   # mutable list so inner fn can update
-
-_groq_lock   = threading.Lock()
-_groq_last   = [0.0]
-
-
-def _wait_for_slot(lock, last_ref, interval, name):
-    with lock:
-        now     = time.time()
-        elapsed = now - last_ref[0]
-        if elapsed < interval:
-            wait = interval - elapsed
-            print(f"  [AI] {name} rate slot: sleeping {wait:.1f}s")
-            time.sleep(wait)
-        last_ref[0] = time.time()
+_gemini_last = [0.0]
+_groq_lock = threading.Lock()
+_groq_last = [0.0]
+_state_lock = threading.RLock()
+_provider_state_cache = None
 
 
 def dbg(msg):
     print(f"  [AI] {msg}")
 
 
-# ─────────────────────────────────────────────────────────────
-# SAFETY SETTINGS (allow cybersec content)
-# ─────────────────────────────────────────────────────────────
-
-_SAFETY = [
-    types.SafetySetting(
-        category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-        threshold=types.HarmBlockThreshold.BLOCK_NONE,
-    ),
-    types.SafetySetting(
-        category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
-        threshold=types.HarmBlockThreshold.BLOCK_NONE,
-    ),
-    types.SafetySetting(
-        category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-        threshold=types.HarmBlockThreshold.BLOCK_NONE,
-    ),
-    types.SafetySetting(
-        category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-        threshold=types.HarmBlockThreshold.BLOCK_NONE,
-    ),
-]
+def _uniq(items):
+    seen = set()
+    ordered = []
+    for item in items:
+        if item and item not in seen:
+            ordered.append(item)
+            seen.add(item)
+    return ordered
 
 
-# ─────────────────────────────────────────────────────────────
-# PROMPT BUILDERS  (unchanged from original)
-# ─────────────────────────────────────────────────────────────
+ARTICLE_GROQ_MODELS = _uniq([GROQ_ARTICLE_MODEL, GROQ_ARTICLE_FALLBACK_MODEL, GROQ_SYNTHESIS_MODEL])
+SYNTHESIS_GROQ_MODELS = _uniq([GROQ_SYNTHESIS_MODEL, GROQ_ARTICLE_FALLBACK_MODEL, GROQ_ARTICLE_MODEL])
+TEXT_GROQ_MODELS = _uniq([GROQ_TEXT_MODEL, GROQ_SYNTHESIS_MODEL, GROQ_ARTICLE_FALLBACK_MODEL, GROQ_ARTICLE_MODEL])
+SYNTHESIS_GEMINI_MODELS = _uniq([GEMINI_SYNTHESIS_MODEL, GEMINI_FALLBACK_MODEL])
+GENERAL_GEMINI_MODELS = _uniq([GEMINI_FALLBACK_MODEL, GEMINI_SYNTHESIS_MODEL])
+
+
+def _default_provider_state():
+    return {
+        "gemini": {
+            "blocked_until": 0.0,
+            "last_error": "",
+            "usage": {
+                "all": [],
+                "synthesis": [],
+                "general": [],
+            },
+        },
+        "groq": {
+            "blocked_until": 0.0,
+            "last_error": "",
+            "usage": {
+                "all": [],
+            },
+        },
+    }
+
+
+def _prune_usage(items, now):
+    week_ago = now - 7 * 24 * 3600
+    return [float(ts) for ts in items if isinstance(ts, (int, float)) and float(ts) >= week_ago]
+
+
+def _load_provider_state_unlocked():
+    if not os.path.exists(PROVIDER_STATE_FILE):
+        return _default_provider_state()
+
+    try:
+        with open(PROVIDER_STATE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        data = _default_provider_state()
+
+    defaults = _default_provider_state()
+    now = time.time()
+
+    for provider, provider_defaults in defaults.items():
+        data.setdefault(provider, {})
+        data[provider].setdefault("blocked_until", provider_defaults["blocked_until"])
+        data[provider].setdefault("last_error", provider_defaults["last_error"])
+        usage = data[provider].setdefault("usage", {})
+        for bucket, timestamps in provider_defaults["usage"].items():
+            usage[bucket] = _prune_usage(usage.get(bucket, timestamps), now)
+
+    return data
+
+
+def _get_provider_state():
+    global _provider_state_cache
+    with _state_lock:
+        if _provider_state_cache is None:
+            _provider_state_cache = _load_provider_state_unlocked()
+        return _provider_state_cache
+
+
+def _save_provider_state():
+    with _state_lock:
+        state = _provider_state_cache or _default_provider_state()
+        with open(PROVIDER_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+
+
+def _count_recent(timestamps, now, window_seconds):
+    cutoff = now - window_seconds
+    return sum(1 for ts in timestamps if ts >= cutoff)
+
+
+def _format_ts(ts):
+    if not ts:
+        return None
+    return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(ts))
+
+
+def _set_provider_error(provider, message):
+    state = _get_provider_state()
+    with _state_lock:
+        state[provider]["last_error"] = message[:300]
+    _save_provider_state()
+
+
+def _sync_provider_state_to_hf():
+    try:
+        from storage_backend import is_configured, push_state
+
+        if is_configured():
+            push_state(new_articles=[])
+    except Exception:
+        pass
+
+
+def _set_provider_cooldown(provider, seconds, message):
+    state = _get_provider_state()
+    with _state_lock:
+        until = time.time() + max(1, seconds)
+        state[provider]["blocked_until"] = max(state[provider].get("blocked_until", 0.0), until)
+        state[provider]["last_error"] = message[:300]
+    _save_provider_state()
+    _sync_provider_state_to_hf()
+
+
+def _clear_provider_cooldown(provider):
+    state = _get_provider_state()
+    with _state_lock:
+        if state[provider].get("blocked_until", 0.0) < time.time():
+            state[provider]["blocked_until"] = 0.0
+            if "429" in state[provider].get("last_error", ""):
+                state[provider]["last_error"] = ""
+    _save_provider_state()
+
+
+def _record_provider_usage(provider, bucket):
+    state = _get_provider_state()
+    now = time.time()
+    with _state_lock:
+        usage = state[provider]["usage"]
+        usage["all"] = _prune_usage(usage.get("all", []), now)
+        usage["all"].append(now)
+        if bucket not in usage:
+            usage[bucket] = []
+        usage[bucket] = _prune_usage(usage.get(bucket, []), now)
+        if bucket != "all":
+            usage[bucket].append(now)
+    _save_provider_state()
+
+
+def _bucket_counts(provider, bucket):
+    state = _get_provider_state()
+    now = time.time()
+    usage = state[provider]["usage"]
+    bucket_usage = _prune_usage(usage.get(bucket, []), now)
+    with _state_lock:
+        usage[bucket] = bucket_usage
+        usage["all"] = _prune_usage(usage.get("all", []), now)
+    return {
+        "hour": _count_recent(bucket_usage, now, 3600),
+        "day": _count_recent(bucket_usage, now, 86400),
+        "week": _count_recent(bucket_usage, now, 7 * 86400),
+        "all_hour": _count_recent(usage.get("all", []), now, 3600),
+        "all_day": _count_recent(usage.get("all", []), now, 86400),
+    }
+
+
+def _quota_reason(provider, bucket):
+    state = _get_provider_state()
+    now = time.time()
+    blocked_until = float(state[provider].get("blocked_until", 0.0) or 0.0)
+    if blocked_until > now:
+        return False, f"cooldown until {_format_ts(blocked_until)}"
+
+    counts = _bucket_counts(provider, bucket)
+
+    if provider == "gemini" and bucket == "synthesis":
+        if counts["hour"] >= GEMINI_SYNTHESIS_HOURLY_LIMIT:
+            return False, "synthesis hourly budget exhausted"
+        if counts["day"] >= GEMINI_SYNTHESIS_DAILY_LIMIT:
+            return False, "synthesis daily budget exhausted"
+        if counts["week"] >= GEMINI_SYNTHESIS_WEEKLY_LIMIT:
+            return False, "synthesis weekly budget exhausted"
+
+    if provider == "gemini" and bucket == "general":
+        if counts["hour"] >= GEMINI_GENERAL_HOURLY_LIMIT:
+            return False, "general hourly budget exhausted"
+        if counts["day"] >= GEMINI_GENERAL_DAILY_LIMIT:
+            return False, "general daily budget exhausted"
+
+    if provider == "groq":
+        if counts["all_hour"] >= GROQ_HOURLY_LIMIT:
+            return False, "hourly budget exhausted"
+        if counts["all_day"] >= GROQ_DAILY_LIMIT:
+            return False, "daily budget exhausted"
+
+    return True, ""
+
+
+def _claim_provider_slot(provider, bucket, interval, lock, last_ref, label):
+    allowed, reason = _quota_reason(provider, bucket)
+    if not allowed:
+        dbg(f"{label} skipped: {reason}")
+        return False
+
+    with lock:
+        now = time.time()
+        elapsed = now - last_ref[0]
+        if elapsed < interval:
+            wait = interval - elapsed
+            dbg(f"{label} rate slot: sleeping {wait:.1f}s")
+            time.sleep(wait)
+        last_ref[0] = time.time()
+        _record_provider_usage(provider, bucket)
+    return True
+
+
+def _gemini_cooldown_seconds(message):
+    text = message.lower()
+    if "per day" in text or "daily" in text or "quota" in text:
+        return GEMINI_COOLDOWN_DAILY_SECONDS
+    return GEMINI_COOLDOWN_429_SECONDS
+
+
+def _groq_cooldown_seconds(message):
+    return GROQ_COOLDOWN_429_SECONDS
+
+
+if types:
+    _SAFETY = [
+        types.SafetySetting(
+            category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+            threshold=types.HarmBlockThreshold.BLOCK_NONE,
+        ),
+        types.SafetySetting(
+            category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+            threshold=types.HarmBlockThreshold.BLOCK_NONE,
+        ),
+        types.SafetySetting(
+            category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+            threshold=types.HarmBlockThreshold.BLOCK_NONE,
+        ),
+        types.SafetySetting(
+            category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+            threshold=types.HarmBlockThreshold.BLOCK_NONE,
+        ),
+    ]
+else:
+    _SAFETY = []
+
 
 SYSTEM_PROMPT = """You are an elite intelligence analyst covering cybersecurity, AI, technology, hardware, and mobile.
 Your job is to deeply analyze articles and extract structured intelligence.
@@ -217,24 +441,13 @@ Return this exact JSON:
 Return ONLY the JSON object."""
 
 
-# ─────────────────────────────────────────────────────────────
-# ENGINE CALLS  (JSON mode — for structured analysis)
-# ─────────────────────────────────────────────────────────────
-
-
-
-
-# ─────────────────────────────────────────────────────────────
-# JSON PARSER
-# ─────────────────────────────────────────────────────────────
-
 def extract_json(text: str) -> dict | None:
     if not text:
         return None
     try:
         text = text.replace("```json", "").replace("```", "").strip()
         start = text.find("{")
-        end   = text.rfind("}") + 1
+        end = text.rfind("}") + 1
         if start == -1 or end == 0:
             return None
         return json.loads(text[start:end])
@@ -242,10 +455,6 @@ def extract_json(text: str) -> dict | None:
         dbg(f"JSON parse error: {e}")
         return None
 
-
-# ─────────────────────────────────────────────────────────────
-# KEYWORD SEVERITY  (backup classifier + pre-screen)
-# ─────────────────────────────────────────────────────────────
 
 _CRITICAL_KW = [
     "rce", "remote code execution", "zero-day", "0-day", "actively exploited",
@@ -263,64 +472,176 @@ _MEDIUM_KW = [
 
 
 def keyword_severity(title: str, content: str = "") -> str:
-    text  = (title + " " + content).lower()
+    text = (title + " " + content).lower()
     score = 0
-    for k in _CRITICAL_KW:
-        if k in text: score += 4
-    for k in _HIGH_KW:
-        if k in text: score += 2
-    for k in _MEDIUM_KW:
-        if k in text: score += 1
+    for kw in _CRITICAL_KW:
+        if kw in text:
+            score += 4
+    for kw in _HIGH_KW:
+        if kw in text:
+            score += 2
+    for kw in _MEDIUM_KW:
+        if kw in text:
+            score += 1
 
-    if score >= 12: return "CRITICAL"
-    if score >= 7:  return "HIGH"
-    if score >= 3:  return "MEDIUM"
-    if score >= 1:  return "LOW"
+    if score >= 12:
+        return "CRITICAL"
+    if score >= 7:
+        return "HIGH"
+    if score >= 3:
+        return "MEDIUM"
+    if score >= 1:
+        return "LOW"
     return "MINIMAL"
 
 
-# ─────────────────────────────────────────────────────────────
-# PUBLIC ANALYSIS FUNCTIONS  (ALL articles get full AI — per user request)
-# ─────────────────────────────────────────────────────────────
+def _groq_json_call(prompt: str, models: list[str], retries: int = 2) -> str | None:
+    if not groq_client:
+        return None
+
+    for model in models:
+        for attempt in range(1, retries + 1):
+            if not _claim_provider_slot("groq", "all", GROQ_MIN_INTERVAL, _groq_lock, _groq_last, f"Groq({model[:18]})"):
+                return None
+            try:
+                dbg(f"Groq JSON call [{model}] attempt {attempt}/{retries}")
+                chat = groq_client.chat.completions.create(
+                    messages=[{"role": "user", "content": prompt}],
+                    model=model,
+                    response_format={"type": "json_object"},
+                    timeout=45,
+                )
+                _clear_provider_cooldown("groq")
+                return chat.choices[0].message.content
+            except Exception as e:
+                message = str(e)
+                lower = message.lower()
+                if "429" in lower or "rate" in lower or "too_many" in lower:
+                    cooldown = _groq_cooldown_seconds(message)
+                    _set_provider_cooldown("groq", cooldown, message)
+                    dbg(f"Groq 429 on {model}; cooling down for {cooldown}s")
+                    break
+                if "model" in lower and "not found" in lower:
+                    _set_provider_error("groq", message)
+                    dbg(f"Groq model unavailable: {model}")
+                    break
+                _set_provider_error("groq", message)
+                dbg(f"Groq error on {model}: {e}")
+                if attempt < retries:
+                    time.sleep(min(5, attempt * 2))
+    return None
+
+
+def _groq_text_call(prompt: str, models: list[str], retries: int = 2) -> str | None:
+    if not groq_client:
+        return None
+
+    for model in models:
+        for attempt in range(1, retries + 1):
+            if not _claim_provider_slot("groq", "all", GROQ_MIN_INTERVAL, _groq_lock, _groq_last, f"Groq-text({model[:18]})"):
+                return None
+            try:
+                dbg(f"Groq TEXT call [{model}] attempt {attempt}/{retries}")
+                chat = groq_client.chat.completions.create(
+                    messages=[{"role": "user", "content": prompt}],
+                    model=model,
+                    timeout=60,
+                )
+                _clear_provider_cooldown("groq")
+                return chat.choices[0].message.content
+            except Exception as e:
+                message = str(e)
+                lower = message.lower()
+                if "429" in lower or "rate" in lower or "too_many" in lower:
+                    cooldown = _groq_cooldown_seconds(message)
+                    _set_provider_cooldown("groq", cooldown, message)
+                    dbg(f"Groq TEXT 429 on {model}; cooling down for {cooldown}s")
+                    break
+                if "model" in lower and "not found" in lower:
+                    _set_provider_error("groq", message)
+                    dbg(f"Groq text model unavailable: {model}")
+                    break
+                _set_provider_error("groq", message)
+                dbg(f"Groq text error on {model}: {e}")
+                if attempt < retries:
+                    time.sleep(min(5, attempt * 2))
+    return None
+
+
+def _gemini_call(prompt: str, models: list[str], bucket: str, json_mode: bool, retries: int = 2) -> str | None:
+    if not gemini_client:
+        return None
+
+    for model in models:
+        for attempt in range(1, retries + 1):
+            if not _claim_provider_slot("gemini", bucket, GEMINI_MIN_INTERVAL, _gemini_lock, _gemini_last, f"Gemini({model})"):
+                return None
+            try:
+                dbg(f"Gemini call [{model}] bucket={bucket} attempt {attempt}/{retries}")
+                config = types.GenerateContentConfig(safety_settings=_SAFETY) if types else None
+                if json_mode and config is not None:
+                    config.response_mime_type = "application/json"
+
+                kwargs = {"model": model, "contents": prompt}
+                if config is not None:
+                    kwargs["config"] = config
+                response = gemini_client.models.generate_content(**kwargs)
+                _clear_provider_cooldown("gemini")
+                return response.text
+            except Exception as e:
+                message = str(e)
+                lower = message.lower()
+                if "429" in lower or "quota" in lower or "resource_exhausted" in lower:
+                    cooldown = _gemini_cooldown_seconds(message)
+                    _set_provider_cooldown("gemini", cooldown, message)
+                    dbg(f"Gemini 429 on {model}; cooling down for {cooldown}s")
+                    break
+                if "503" in lower or "unavailable" in lower:
+                    _set_provider_error("gemini", message)
+                    time.sleep(10 + random.uniform(0, 3))
+                    continue
+                if "model" in lower and "not found" in lower:
+                    _set_provider_error("gemini", message)
+                    dbg(f"Gemini model unavailable: {model}")
+                    break
+                _set_provider_error("gemini", message)
+                dbg(f"Gemini error on {model}: {e}")
+                if attempt < retries:
+                    time.sleep(5)
+    return None
+
 
 def ai_analyze(title: str, content: str) -> dict:
-    """
-    Full AI analysis of a single article.
-    Uses Groq (fast, 30 RPM) as primary — saves Gemini quota for synthesis.
-    """
     prompt = build_analysis_prompt(title, content)
-    raw    = local_call_article(prompt)   # ← Groq-primary route
-    data   = extract_json(raw)
+    raw = local_call_article(prompt)
+    data = extract_json(raw)
 
-    kw_sev    = keyword_severity(title, content)
+    kw_sev = keyword_severity(title, content)
     sev_order = ["MINIMAL", "LOW", "MEDIUM", "HIGH", "CRITICAL"]
 
     if data:
         ai_sev = data.get("severity", "LOW")
         ai_idx = sev_order.index(ai_sev) if ai_sev in sev_order else 2
         kw_idx = sev_order.index(kw_sev) if kw_sev in sev_order else 1
-        # Take the higher of AI vs keyword (never downgrade)
         data["severity"] = sev_order[max(ai_idx, kw_idx)]
         return data
 
     dbg("AI failed — using keyword fallback for this article")
     return {
-        "severity":          kw_sev,
-        "category":          "tech",
-        "confidence":        1,
-        "summary":           ["AI analysis unavailable — keyword classification used"],
-        "tags":              [],
-        "cves":              [],
-        "actors":            [],
+        "severity": kw_sev,
+        "category": "tech",
+        "confidence": 1,
+        "summary": ["AI analysis unavailable — keyword classification used"],
+        "tags": [],
+        "cves": [],
+        "actors": [],
         "affected_products": [],
     }
 
 
 def ai_digest(items: list, cycle_label: str = "8-hour cycle") -> dict | None:
     sev_map = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "MINIMAL": 1}
-    sorted_items = sorted(
-        items, key=lambda x: sev_map.get(x.get("severity", "LOW"), 0), reverse=True
-    )
+    sorted_items = sorted(items, key=lambda x: sev_map.get(x.get("severity", "LOW"), 0), reverse=True)
 
     items_text = ""
     for item in sorted_items:
@@ -328,8 +649,8 @@ def ai_digest(items: list, cycle_label: str = "8-hour cycle") -> dict | None:
         if isinstance(summary, list):
             summary = " | ".join(summary)
         items_text += (
-            f"[{item.get('severity','?')}][{item.get('category','tech')}] "
-            f"{item.get('title','')}\n  {summary[:250]}\n\n"
+            f"[{item.get('severity', '?')}][{item.get('category', 'tech')}] "
+            f"{item.get('title', '')}\n  {summary[:250]}\n\n"
         )
         if len(items_text) > 8000:
             break
@@ -340,8 +661,8 @@ def ai_digest(items: list, cycle_label: str = "8-hour cycle") -> dict | None:
 
 def ai_daily_summary(digests: list) -> dict | None:
     digests_text = ""
-    for i, d in enumerate(digests, 1):
-        digests_text += f"\n--- DIGEST {i} ---\n{json.dumps(d, indent=2)}\n"
+    for idx, digest in enumerate(digests, 1):
+        digests_text += f"\n--- DIGEST {idx} ---\n{json.dumps(digest, indent=2)}\n"
 
     raw = local_call(build_daily_prompt(digests_text[:12000]))
     return extract_json(raw)
@@ -349,201 +670,105 @@ def ai_daily_summary(digests: list) -> dict | None:
 
 def ai_weekly_summary(items: list) -> dict | None:
     sev_map = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "MINIMAL": 1}
-    sorted_items = sorted(
-        items, key=lambda x: sev_map.get(x.get("severity", "LOW"), 0), reverse=True
-    )
+    sorted_items = sorted(items, key=lambda x: sev_map.get(x.get("severity", "LOW"), 0), reverse=True)
 
     items_text = ""
     for item in sorted_items[:40]:
-        summary = item.get("summary_text", "")
-        items_text += f"[{item.get('severity','?')}] {item.get('title','')}\n  {summary[:200]}\n\n"
+        items_text += f"[{item.get('severity', '?')}] {item.get('title', '')}\n  {item.get('summary_text', '')[:200]}\n\n"
 
     raw = local_call(build_weekly_prompt(items_text[:12000]))
     return extract_json(raw)
 
-# ─────────────────────────────────────────────────────────────
-# ENGINE CALLS
-# ─────────────────────────────────────────────────────────────
-
-# ── GROQ ── (Primary for bulk article analysis — 30 RPM, fast)
-
-def groq_call(prompt: str, model: str = "llama-3.1-8b-instant", retries: int = 3) -> str | None:
-    """
-    JSON-mode Groq call.
-    Default model: llama-3.1-8b-instant (30 RPM, fastest for bulk).
-    Pass model="llama-3.3-70b-versatile" for synthesis fallback.
-    """
-    if not groq_client:
-        return None
-
-    for attempt in range(1, retries + 1):
-        _wait_for_slot(_groq_lock, _groq_last, GROQ_MIN_INTERVAL, f"Groq({model[:12]})")
-        try:
-            dbg(f"Groq JSON call [{model[:20]}] attempt {attempt}/{retries}")
-            chat = groq_client.chat.completions.create(
-                messages=[{"role": "user", "content": prompt}],
-                model=model,
-                response_format={"type": "json_object"},
-                timeout=45,
-            )
-            return chat.choices[0].message.content
-        except Exception as e:
-            err = str(e).lower()
-            if "429" in err or "rate" in err or "too_many" in err:
-                # Groq 429 is usually just RPM — wait retry_after or short backoff
-                retry_after = 5 * attempt   # 5s, 10s, 15s — NOT 30s/60s
-                dbg(f"Groq 429 — backing off {retry_after}s (attempt {attempt}/{retries})")
-                time.sleep(retry_after)
-            elif "model" in err and "not found" in err:
-                dbg(f"Groq model not found: {model} — aborting")
-                return None
-            else:
-                dbg(f"Groq error: {e}")
-                if attempt < retries:
-                    time.sleep(3)
-                else:
-                    return None
-
-    dbg("Groq: all retries exhausted")
-    return None
-
-
-def groq_call_text(prompt: str, model: str = "llama-3.3-70b-versatile", retries: int = 3) -> str | None:
-    """Plain-text Groq call for deepdive dossiers (no JSON forced)."""
-    if not groq_client:
-        return None
-
-    for attempt in range(1, retries + 1):
-        _wait_for_slot(_groq_lock, _groq_last, GROQ_MIN_INTERVAL, f"Groq-text({model[:12]})")
-        try:
-            dbg(f"Groq TEXT call [{model[:20]}] attempt {attempt}/{retries}")
-            chat = groq_client.chat.completions.create(
-                messages=[{"role": "user", "content": prompt}],
-                model=model,
-                timeout=60,
-            )
-            return chat.choices[0].message.content
-        except Exception as e:
-            err = str(e).lower()
-            if "429" in err or "rate" in err:
-                retry_after = 5 * attempt
-                dbg(f"Groq-text 429 — backing off {retry_after}s")
-                time.sleep(retry_after)
-            else:
-                dbg(f"Groq-text error: {e}")
-                if attempt < retries:
-                    time.sleep(3)
-                else:
-                    return None
-
-    return None
-
-
-# ── GEMINI ── (Primary for synthesis — better reasoning, saved for important tasks)
-
-def gemini_call(prompt: str, retries: int = 3) -> str | None:
-    """JSON-mode Gemini 2.5 Flash call. Used for digests, daily, weekly summaries."""
-    if not gemini_client:
-        return None
-
-    for attempt in range(1, retries + 1):
-        _wait_for_slot(_gemini_lock, _gemini_last, GEMINI_MIN_INTERVAL, "Gemini")
-        try:
-            dbg(f"Gemini JSON call (attempt {attempt}/{retries})")
-            response = gemini_client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    safety_settings=_SAFETY,
-                ),
-            )
-            return response.text
-        except Exception as e:
-            err = str(e).lower()
-            if "429" in err or "quota" in err or "resource_exhausted" in err:
-                # Gemini 429 needs longer backoff (TPM + RPM limits)
-                wait = (2 ** attempt) * 20 + random.uniform(0, 10)  # 40s, 80s, 160s
-                dbg(f"Gemini 429 — backing off {wait:.0f}s (attempt {attempt}/{retries})")
-                time.sleep(wait)
-            elif "503" in err or "unavailable" in err:
-                time.sleep(15 + random.uniform(0, 5))
-            else:
-                dbg(f"Gemini error: {e}")
-                return None
-
-    dbg("Gemini: all retries exhausted")
-    return None
-
-
-def gemini_call_text(prompt: str, retries: int = 3) -> str | None:
-    """Plain-text Gemini call for deepdive (no JSON mode). Better formatting."""
-    if not gemini_client:
-        return None
-
-    for attempt in range(1, retries + 1):
-        _wait_for_slot(_gemini_lock, _gemini_last, GEMINI_MIN_INTERVAL, "Gemini-text")
-        try:
-            dbg(f"Gemini TEXT call (attempt {attempt}/{retries})")
-            response = gemini_client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=prompt,
-                config=types.GenerateContentConfig(safety_settings=_SAFETY),
-            )
-            return response.text
-        except Exception as e:
-            err = str(e).lower()
-            if "429" in err or "quota" in err or "resource_exhausted" in err:
-                wait = (2 ** attempt) * 20 + random.uniform(0, 10)
-                dbg(f"Gemini-text 429 — backing off {wait:.0f}s")
-                time.sleep(wait)
-            elif "503" in err or "unavailable" in err:
-                time.sleep(15)
-            else:
-                dbg(f"Gemini-text error: {e}")
-                return None
-
-    return None
-
-
-# ─────────────────────────────────────────────────────────────
-# ROUTERS — smart model selection by task type
-# ─────────────────────────────────────────────────────────────
 
 def local_call(prompt: str) -> str | None:
     """
-    SYNTHESIS router (digest / daily / weekly / quiz).
-    Gemini 2.5 Flash PRIMARY → Groq 70b fallback.
-    High quality needed, low volume.
+    Scheduled synthesis router.
+    Gemini is reserved here for 8h, daily, weekly, and newsletter-quality output.
     """
-    result = gemini_call(prompt)
-    if not result:
-        dbg("Gemini failed — trying Groq-70b fallback for synthesis")
-        result = groq_call(prompt, model="llama-3.3-70b-versatile")
-    return result
+    result = _gemini_call(prompt, SYNTHESIS_GEMINI_MODELS, bucket="synthesis", json_mode=True)
+    if result:
+        return result
+
+    dbg("Gemini synthesis unavailable — falling back to Groq synthesis")
+    return _groq_json_call(prompt, SYNTHESIS_GROQ_MODELS)
+
+
+def local_call_general_json(prompt: str) -> str | None:
+    """
+    Interactive JSON router.
+    Groq first so bot features do not spend the reserved Gemini synthesis budget.
+    """
+    result = _groq_json_call(prompt, ARTICLE_GROQ_MODELS)
+    if result:
+        return result
+
+    dbg("Groq JSON unavailable — trying Gemini general fallback")
+    return _gemini_call(prompt, GENERAL_GEMINI_MODELS, bucket="general", json_mode=True)
 
 
 def local_call_article(prompt: str) -> str | None:
-    """
-    ARTICLE ANALYSIS router (bulk, per-article).
-    Groq 8b PRIMARY → Gemini fallback.
-    Speed matters — Groq handles 30 RPM vs Gemini's 15 RPM.
-    """
-    result = groq_call(prompt, model="llama-3.1-8b-instant")
-    if not result:
-        dbg("Groq failed — trying Gemini fallback for article")
-        result = gemini_call(prompt)
-    return result
+    result = _groq_json_call(prompt, ARTICLE_GROQ_MODELS)
+    if result:
+        return result
+
+    dbg("Groq article route unavailable — trying Gemini fallback")
+    return _gemini_call(prompt, GENERAL_GEMINI_MODELS, bucket="general", json_mode=True)
 
 
 def local_call_text(prompt: str) -> str | None:
-    """
-    TEXT router for deepdive dossiers (plain markdown, not JSON).
-    Gemini PRIMARY (better prose) → Groq-70b fallback.
-    """
-    result = gemini_call_text(prompt)
-    if not result:
-        dbg("Gemini-text failed — trying Groq-70b text fallback")
-        result = groq_call_text(prompt, model="llama-3.3-70b-versatile")
-    return result
+    result = _groq_text_call(prompt, TEXT_GROQ_MODELS)
+    if result:
+        return result
 
+    dbg("Groq text route unavailable — trying Gemini general fallback")
+    return _gemini_call(prompt, GENERAL_GEMINI_MODELS, bucket="general", json_mode=False)
+
+
+def get_provider_status() -> dict:
+    state = copy.deepcopy(_get_provider_state())
+    now = time.time()
+
+    gemini_counts = _bucket_counts("gemini", "general")
+    gemini_synth_counts = _bucket_counts("gemini", "synthesis")
+    groq_counts = _bucket_counts("groq", "all")
+
+    def provider_state(provider_name, blocked_until, last_error, usage):
+        provider_status = "ready"
+        if blocked_until and blocked_until > now:
+            provider_status = "cooldown"
+        elif "exhausted" in last_error.lower():
+            provider_status = "budget_guarded"
+        elif last_error:
+            provider_status = "degraded"
+        return {
+            "state": provider_status,
+            "blocked_until": _format_ts(blocked_until),
+            "last_error": last_error,
+            "usage": usage,
+        }
+
+    return {
+        "gemini": provider_state(
+            "gemini",
+            state["gemini"].get("blocked_until", 0.0),
+            state["gemini"].get("last_error", ""),
+            {
+                "hour": gemini_counts["hour"],
+                "day": gemini_counts["day"],
+                "week": gemini_counts["week"],
+                "synthesis_hour": gemini_synth_counts["hour"],
+                "synthesis_day": gemini_synth_counts["day"],
+                "synthesis_week": gemini_synth_counts["week"],
+            },
+        ),
+        "groq": provider_state(
+            "groq",
+            state["groq"].get("blocked_until", 0.0),
+            state["groq"].get("last_error", ""),
+            {
+                "hour": groq_counts["all_hour"],
+                "day": groq_counts["all_day"],
+                "week": groq_counts["week"],
+            },
+        ),
+    }

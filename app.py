@@ -15,6 +15,7 @@ import os
 import threading
 import requests
 from flask import Flask, request, jsonify
+from storage_backend import pull_state, is_configured
 
 app = Flask(__name__)
 
@@ -89,8 +90,8 @@ def register_webhook():
             api_url,
             json={
                 "url":             webhook_url,
-                "allowed_updates": ["message"],
-                "drop_pending_updates": True,
+                "allowed_updates": ["message", "channel_post", "edited_message", "edited_channel_post"],
+                "drop_pending_updates": False,
             },
             timeout=30,
         )
@@ -153,6 +154,10 @@ def send_startup_message():
 
 if __name__ == "__main__":
     print("[CLOUD] Starting JARVIS Bot...")
+
+    if is_configured():
+        print("[CLOUD] Restoring persisted HF state before webhook startup...")
+        pull_state()
 
     # 1. Try to register Telegram webhook (best mode for HF Spaces)
     webhook_ok = register_webhook()

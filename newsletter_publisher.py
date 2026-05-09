@@ -5,7 +5,8 @@ Styled specifically for akpghub.live dark/tech theme.
 """
 
 import os
-import json
+import html
+import time
 from datetime import datetime
 import requests
 from requests.auth import HTTPBasicAuth
@@ -80,60 +81,126 @@ def generate_html(ai_summary):
     risk = ai_summary.get("risk_level", "LOW")
     day_summary = ai_summary.get("day_summary", "No summary available.")
     
-    html = f"""
+    content_html = f"""
     <div class="jarvis-wrapper">
+        <h1>{html.escape(headline)}</h1>
         <p><strong>Date:</strong> {date_str} | <strong>Overall Risk:</strong> <span class="jarvis-risk-{risk}">{risk}</span></p>
         
         <div class="jarvis-summary">
             <strong>🎯 Executive Summary:</strong><br><br>
-            {day_summary}
+            {html.escape(day_summary)}
         </div>
     """
 
     threats = ai_summary.get("escalating_threats",[])
     if threats:
-        html += "<h2>🔺 Escalating Threats</h2><ul>"
-        for t in threats: html += f"<li>{t}</li>"
-        html += "</ul>"
+        content_html += "<h2>🔺 Escalating Threats</h2><ul>"
+        for t in threats:
+            content_html += f"<li>{html.escape(str(t))}</li>"
+        content_html += "</ul>"
 
     cves = ai_summary.get("critical_cves",[])
     if cves:
-        html += "<h2>🔴 Key Vulnerabilities (CVEs)</h2><p>"
-        for cve in cves: html += f'<span class="jarvis-cve">{cve}</span>'
-        html += "</p>"
+        content_html += "<h2>🔴 Key Vulnerabilities (CVEs)</h2><p>"
+        for cve in cves:
+            content_html += f'<span class="jarvis-cve">{html.escape(str(cve))}</span>'
+        content_html += "</p>"
 
     trends = ai_summary.get("tech_trends",[])
     if trends:
-        html += "<h2>💡 Tech & AI Trends</h2><ul>"
-        for t in trends: html += f"<li>{t}</li>"
-        html += "</ul>"
+        content_html += "<h2>💡 Tech & AI Trends</h2><ul>"
+        for t in trends:
+            content_html += f"<li>{html.escape(str(t))}</li>"
+        content_html += "</ul>"
 
     actions = ai_summary.get("recommendations",[])
     if actions:
-        html += "<h2>✅ Actionable Recommendations</h2><ul>"
-        for a in actions: html += f"<li><strong>Action:</strong> {a}</li>"
-        html += "</ul>"
+        content_html += "<h2>✅ Actionable Recommendations</h2><ul>"
+        for a in actions:
+            content_html += f"<li><strong>Action:</strong> {html.escape(str(a))}</li>"
+        content_html += "</ul>"
         
-    html += "</div>"
-    return html
+    content_html += "</div>"
+    return content_html
+
+
+def _build_reference_section(all_items):
+    items = sorted(
+        all_items,
+        key=lambda item: {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}.get(item.get("severity", "LOW"), 0),
+        reverse=True,
+    )
+    refs = []
+    for item in items[:10]:
+        title = html.escape(str(item.get("title", "")))
+        link = html.escape(str(item.get("link", "")))
+        severity = html.escape(str(item.get("severity", "LOW")))
+        if title and link:
+            refs.append(f'<li><strong>[{severity}]</strong> <a href="{link}" target="_blank" rel="noopener noreferrer">{title}</a></li>')
+    if not refs:
+        return ""
+    return "<h2>🔗 Key Source Articles</h2><ul>" + "".join(refs) + "</ul>"
+
+
+def _request_with_retry(method, url, auth, headers=None, params=None, json_data=None):
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            response = requests.request(
+                method,
+                url,
+                auth=auth,
+                headers=headers,
+                params=params,
+                json=json_data,
+                timeout=30,
+            )
+            if response.status_code in (200, 201):
+                return response
+            last_error = f"HTTP {response.status_code}: {response.text[:300]}"
+        except Exception as e:
+            last_error = str(e)
+        time.sleep(attempt * 2)
+    raise RuntimeError(last_error or "Unknown WordPress error")
+
+
+def _find_existing_post(api_root, auth, headers, slug):
+    response = _request_with_retry(
+        "GET",
+        f"{api_root}/posts",
+        auth=auth,
+        headers=headers,
+        params={"slug": slug, "per_page": 1},
+    )
+    data = response.json()
+    if data:
+        return data[0]
+    return None
+
 
 def save_and_publish_newsletter(ai_summary, all_items):
     if not ai_summary:
         return
         
-    html_content = generate_html(ai_summary)
-    title = f"JARVIS Threat Intel: {datetime.now().strftime('%B %d, %Y')}"
+    html_content = generate_html(ai_summary) + _build_reference_section(all_items)
+    date_now = datetime.now()
+    title = f"JARVIS Threat Intel: {date_now.strftime('%B %d, %Y')}"
+    slug = f"jarvis-threat-intel-{date_now.strftime('%Y-%m-%d')}"
     
     wp_url = os.getenv("WP_URL")
     wp_user = os.getenv("WP_USER")
     wp_pass = os.getenv("WP_APP_PASSWORD")
+    wp_category_id = os.getenv("WP_CATEGORY_ID", "46")
+    wp_post_status = os.getenv("WP_POST_STATUS", "publish")
     
     if not wp_url or not wp_user or not wp_pass:
         print("[NEWSLETTER] WordPress credentials missing in .env. Skipping publish.")
         return
         
     print("[NEWSLETTER] Publishing to WordPress (Bypassing Cloudflare)...")
-    api_url = f"{wp_url.rstrip('/')}/wp-json/wp/v2/posts"
+    api_root = f"{wp_url.rstrip('/')}/wp-json/wp/v2"
+    api_url = f"{api_root}/posts"
+    auth = HTTPBasicAuth(wp_user, wp_pass)
     
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -144,16 +211,33 @@ def save_and_publish_newsletter(ai_summary, all_items):
     data = {
         "title": title,
         "content": CSS_STYLE + html_content,
-        "status": "publish", 
-        "categories":[46]  # Auto-routes to your Newsletter category!
+        "status": wp_post_status,
+        "slug": slug,
+        "excerpt": ai_summary.get("day_summary", "")[:250],
+        "categories": [int(wp_category_id)],
     }
     
     try:
-        response = requests.post(api_url, auth=HTTPBasicAuth(wp_user, wp_pass), json=data, headers=headers, timeout=30)
-        if response.status_code in[200, 201]:
-            link = response.json().get('link')
-            print(f"[NEWSLETTER] Success! Published at: {link}")
+        existing = _find_existing_post(api_root, auth, headers, slug)
+        if existing:
+            response = _request_with_retry(
+                "POST",
+                f"{api_url}/{existing['id']}",
+                auth=auth,
+                headers=headers,
+                json_data=data,
+            )
+            link = response.json().get("link")
+            print(f"[NEWSLETTER] Updated existing post: {link}")
         else:
-            print(f"[NEWSLETTER] Failed. HTTP {response.status_code}: {response.text[:200]}")
+            response = _request_with_retry(
+                "POST",
+                api_url,
+                auth=auth,
+                headers=headers,
+                json_data=data,
+            )
+            link = response.json().get("link")
+            print(f"[NEWSLETTER] Success! Published at: {link}")
     except Exception as e:
         print(f"[NEWSLETTER] Error connecting to WordPress: {e}")

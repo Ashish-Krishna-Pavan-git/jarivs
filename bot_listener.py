@@ -25,9 +25,9 @@ from config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 from queue_manager import stats as queue_stats
 from telemetry import get_stats as tele_stats
 from storage import load_last_n_hours
-from ai_router import local_call, local_call_text, extract_json
+from ai_router import local_call_general_json, local_call_text, extract_json, get_provider_status
+from subscriber_store import load_subscribers, subscribe, unsubscribe
 
-SUBS_FILE    = os.path.join("data", "subscribers.json")
 HF_SPACE_URL = os.getenv("HF_SPACE_URL", "").rstrip("/")
 
 # Shared session with auto-retry (handles transient network errors)
@@ -41,23 +41,60 @@ _adapter = HTTPAdapter(max_retries=Retry(
 _session.mount("https://", _adapter)
 
 
-def _load_subs():
-    os.makedirs("data", exist_ok=True)
-    if not os.path.exists(SUBS_FILE):
-        default = [str(TELEGRAM_CHAT_ID)] if TELEGRAM_CHAT_ID else []
-        _save_subs(default)
-        return set(default)
+HELP_TEXT = (
+    "🤖 JARVIS Commands\n\n"
+    "/start - Subscribe this chat to alerts and reports\n"
+    "/stop - Unsubscribe this chat\n"
+    "/status - Show queue, cycle, provider, and subscriber status\n"
+    "/quiz - Generate an intelligence quiz from recent items\n"
+    "/deepdive <topic> - Build a dossier from the last 7 days\n"
+    "/limits - Show Groq and Gemini usage/cooldown status\n"
+    "/help - Show this help message\n\n"
+    "Tips:\n"
+    "- In groups, use commands like /status@YourBotName if needed.\n"
+    "- For best control, talk to the bot in a private chat first with /start."
+)
+
+
+def _normalize_command(text: str) -> tuple[str, str]:
+    text = (text or "").strip()
+    if not text.startswith("/"):
+        return "", text
+
+    parts = text.split(None, 1)
+    command = parts[0].split("@", 1)[0].lower()
+    args = parts[1].strip() if len(parts) > 1 else ""
+    return command, args
+
+
+def _format_provider_line(name: str, status: dict) -> str:
+    blocked = status.get("blocked_until") or "ready"
+    usage = status.get("usage", {})
+    return (
+        f"{name}: state={status.get('state', 'unknown')} | "
+        f"hour={usage.get('hour', 0)} | day={usage.get('day', 0)} | "
+        f"blocked_until={blocked}"
+    )
+
+
+def register_bot_commands():
+    if not TELEGRAM_TOKEN:
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setMyCommands"
+    commands = [
+        {"command": "start", "description": "Subscribe this chat"},
+        {"command": "stop", "description": "Unsubscribe this chat"},
+        {"command": "status", "description": "System and provider status"},
+        {"command": "quiz", "description": "Generate an intel quiz"},
+        {"command": "deepdive", "description": "Research a topic from recent data"},
+        {"command": "limits", "description": "Show API cooldown and quota status"},
+        {"command": "help", "description": "Show usage help"},
+    ]
     try:
-        with open(SUBS_FILE) as f:
-            return set(json.load(f))
-    except Exception:
-        return {str(TELEGRAM_CHAT_ID)} if TELEGRAM_CHAT_ID else set()
-
-
-def _save_subs(subs):
-    os.makedirs("data", exist_ok=True)
-    with open(SUBS_FILE, "w") as f:
-        json.dump(list(subs), f)
+        _session.post(url, json={"commands": commands}, timeout=20)
+    except Exception as e:
+        print(f"[BOT] setMyCommands failed: {e}")
 
 
 def send_reply(chat_id, text):
@@ -177,7 +214,7 @@ Return ONLY this JSON:
   "explanation": "Brief explanation of correct answer (under 200 chars)"
 }}"""
 
-    raw  = local_call(prompt)
+    raw  = local_call_general_json(prompt)
     data = extract_json(raw)
 
     if data and "question" in data and len(data.get("options", [])) >= 2:
@@ -199,12 +236,11 @@ Return ONLY this JSON:
 
 
 def handle_message(text, chat_id, first_name):
-    cmd  = text.lower().strip()
-    subs = _load_subs()
+    cmd, args = _normalize_command(text)
+    subs = load_subscribers()
 
     if cmd == "/start":
-        subs.add(str(chat_id))
-        _save_subs(subs)
+        subs = subscribe(chat_id)
         send_reply(chat_id,
             f"👋 *Welcome to JARVIS, {first_name}!*\n\n"
             "🟢 *You are now SUBSCRIBED to intelligence alerts.*\n\n"
@@ -212,12 +248,13 @@ def handle_message(text, chat_id, first_name):
             "• /status — System health\n"
             "• /quiz — Daily intel quiz\n"
             "• /deepdive topic — Research dossier\n"
+            "• /limits — API quota and cooldown status\n"
+            "• /help — Full usage guide\n"
             "• /stop — Unsubscribe\n\n"
-            "🤖 CRITICAL/HIGH alerts sent immediately. 8hr digests every cycle.")
+            "🤖 CRITICAL/HIGH alerts are immediate. Cycle, daily, and weekly reports stay subscribed.")
 
     elif cmd == "/stop":
-        subs.discard(str(chat_id))
-        _save_subs(subs)
+        unsubscribe(chat_id)
         send_reply(chat_id, "🛑 *Unsubscribed.* Send /start to re-subscribe anytime.")
 
     elif cmd == "/status":
@@ -225,6 +262,9 @@ def handle_message(text, chat_id, first_name):
         ts  = tele_stats()
         sev = " | ".join(f"{k}:{v}" for k, v in ts.get("by_severity", {}).items() if v > 0) or "none yet"
         mode = "webhook" if HF_SPACE_URL else "polling"
+        providers = get_provider_status()
+        gemini_line = _format_provider_line("Gemini", providers.get("gemini", {}))
+        groq_line = _format_provider_line("Groq", providers.get("groq", {}))
         send_reply(chat_id,
             f"📊 *JARVIS Status*\n"
             f"━━━━━━━━━━━━━━━━━━\n"
@@ -234,30 +274,63 @@ def handle_message(text, chat_id, first_name):
             f"🔄 Cycles: {ts.get('cycles_run', 0)}\n"
             f"📈 By severity: {sev}\n"
             f"🕐 Last cycle: {ts.get('last_cycle_at', 'never')}\n"
-            f"📡 Mode: {mode}")
+            f"📡 Mode: {mode}\n\n"
+            f"🔌 Providers:\n"
+            f"• {groq_line}\n"
+            f"• {gemini_line}")
+
+    elif cmd == "/help":
+        send_reply(chat_id, HELP_TEXT)
+
+    elif cmd == "/limits":
+        providers = get_provider_status()
+        gemini = providers.get("gemini", {})
+        groq = providers.get("groq", {})
+        send_reply(
+            chat_id,
+            "📏 API Limits\n\n"
+            f"Groq\n"
+            f"• State: {groq.get('state', 'unknown')}\n"
+            f"• Hour/Day: {groq.get('usage', {}).get('hour', 0)}/{groq.get('usage', {}).get('day', 0)}\n"
+            f"• Blocked until: {groq.get('blocked_until') or 'ready'}\n\n"
+            f"Gemini\n"
+            f"• State: {gemini.get('state', 'unknown')}\n"
+            f"• Hour/Day: {gemini.get('usage', {}).get('hour', 0)}/{gemini.get('usage', {}).get('day', 0)}\n"
+            f"• Synthesis today: {gemini.get('usage', {}).get('synthesis_day', 0)}\n"
+            f"• Blocked until: {gemini.get('blocked_until') or 'ready'}\n"
+        )
 
     elif cmd == "/quiz":
         threading.Thread(target=execute_quiz, args=(chat_id,), daemon=True).start()
 
     elif cmd.startswith("/deepdive"):
-        parts = text.strip().split(None, 1)
-        if len(parts) > 1:
-            threading.Thread(target=execute_deepdive, args=(chat_id, parts[1].strip()), daemon=True).start()
+        if args:
+            threading.Thread(target=execute_deepdive, args=(chat_id, args), daemon=True).start()
         else:
             send_reply(chat_id, "⚠️ Usage: `/deepdive <topic>`\nExample: `/deepdive Ransomware`")
 
     elif cmd.startswith("/"):
-        send_reply(chat_id, "❓ Commands: /status /quiz /deepdive <topic> /start /stop")
+        send_reply(chat_id, HELP_TEXT)
+
+    elif text and text.strip().lower() in {"help", "commands", "menu"}:
+        send_reply(chat_id, HELP_TEXT)
 
 
 def handle_update(update):
     """Entry point for both webhook and polling modes."""
     try:
-        msg   = update.get("message", {})
+        msg = (
+            update.get("message")
+            or update.get("channel_post")
+            or update.get("edited_message")
+            or update.get("edited_channel_post")
+            or {}
+        )
         text  = msg.get("text")
         chat  = msg.get("chat", {})
         cid   = chat.get("id")
-        fname = chat.get("first_name", "Agent")
+        user  = msg.get("from", {})
+        fname = user.get("first_name") or chat.get("title") or "Agent"
         if text and cid:
             handle_message(text, str(cid), fname)
     except Exception as e:
@@ -289,6 +362,7 @@ def _poll_loop():
 
 
 def start_listener():
+    register_bot_commands()
     if HF_SPACE_URL:
         print(f"[BOT] Webhook mode — listening at {HF_SPACE_URL}/telegram/<token>")
     else:

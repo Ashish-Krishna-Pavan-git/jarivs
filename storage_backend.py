@@ -14,6 +14,7 @@ SETUP (one-time):
 import os
 import json
 import shutil
+import time
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -24,15 +25,25 @@ except ImportError:
     HF_HUB_OK = False
     print("[HF_STORAGE] huggingface_hub not available — running ephemeral mode")
 
+from config import (
+    SEEN_FILE,
+    DIGEST_STATE_FILE,
+    TELEMETRY_FILE,
+    PROVIDER_STATE_FILE,
+    SUBSCRIBERS_FILE,
+)
+
 REPO_ID   = os.getenv("HF_STORAGE_REPO", "")   # e.g. "AKP-07/jarvis-data"
 HF_TOKEN  = os.getenv("HF_TOKEN", "")
 TMP_DIR   = Path("/tmp/jarvis_hf")
 
 # Files that MUST persist across restarts
 CRITICAL_FILES = [
-    "seen.json",
-    "digest_state.json",
-    "telemetry.json",
+    SEEN_FILE,
+    DIGEST_STATE_FILE,
+    TELEMETRY_FILE,
+    PROVIDER_STATE_FILE,
+    SUBSCRIBERS_FILE,
 ]
 
 BUNDLE_FILE = "articles_bundle.json"   # Rolling 72-hour article bundle
@@ -73,6 +84,7 @@ def _download(remote_name, dest_path):
     """Download one file from HF Dataset repo → dest_path."""
     try:
         TMP_DIR.mkdir(parents=True, exist_ok=True)
+        Path(dest_path).parent.mkdir(parents=True, exist_ok=True)
         downloaded = hf_hub_download(
             repo_id=REPO_ID,
             filename=remote_name,
@@ -94,19 +106,23 @@ def _upload(local_path, remote_name, commit_msg=None):
     api = _api()
     if not api or not os.path.exists(local_path):
         return False
-    try:
-        api.upload_file(
-            path_or_fileobj=str(local_path),
-            path_in_repo=remote_name,
-            repo_id=REPO_ID,
-            repo_type="dataset",
-            token=HF_TOKEN,
-            commit_message=commit_msg or f"Update {remote_name}",
-        )
-        return True
-    except Exception as e:
-        print(f"[HF_STORAGE] Upload {remote_name}: {e}")
-        return False
+    for attempt in range(1, 4):
+        try:
+            api.upload_file(
+                path_or_fileobj=str(local_path),
+                path_in_repo=remote_name,
+                repo_id=REPO_ID,
+                repo_type="dataset",
+                token=HF_TOKEN,
+                commit_message=commit_msg or f"Update {remote_name}",
+            )
+            return True
+        except Exception as e:
+            if attempt == 3:
+                print(f"[HF_STORAGE] Upload {remote_name}: {e}")
+                return False
+            time.sleep(attempt * 2)
+    return False
 
 
 # ─────────────────────────────────────────────────────────────
@@ -158,11 +174,15 @@ def push_state(working_dir=".", new_articles=None):
         bundle_local = TMP_DIR / BUNDLE_FILE
         TMP_DIR.mkdir(parents=True, exist_ok=True)
 
+        # Restore the remote bundle first when this runtime starts fresh.
+        if not bundle_local.exists():
+            _download(BUNDLE_FILE, str(bundle_local))
+
         # Load existing bundle
         existing = []
         if bundle_local.exists():
             try:
-                with open(bundle_local) as f:
+                with open(bundle_local, encoding="utf-8") as f:
                     existing = json.load(f)
             except Exception:
                 existing = []
@@ -182,7 +202,7 @@ def push_state(working_dir=".", new_articles=None):
         # Keep newest 3000
         existing = existing[-3000:]
 
-        with open(bundle_local, "w") as f:
+        with open(bundle_local, "w", encoding="utf-8") as f:
             json.dump(existing, f)
 
         if _upload(str(bundle_local), BUNDLE_FILE, "Update article bundle"):
