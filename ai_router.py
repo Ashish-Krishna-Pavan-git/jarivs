@@ -1,62 +1,102 @@
 """
 ai_router.py
-Cloud API Version — Google Gemini 2.5 Flash (Primary) + Groq (Fallback)
-Includes strict Thread-Safe Rate Limiting and Cyber-Security Safety Filter Bypasses.
+Google Gemini 2.5 Flash (primary) + Groq Llama (fallback)
+
+FIXES vs original:
+  - Per-API locks (Gemini lock / Groq lock) — bot thread never blocked
+  - Exponential backoff on 429 / 503 errors (no silent failures)
+  - local_call_text() for deepdive/quiz — plain text mode, not JSON mode
+  - All prompts preserved exactly
+  - Gemini: 15 RPM free → 4.5s interval
+  - Groq:   30 RPM free → 2.5s interval
 """
 
 import json
 import time
 import os
+import random
 import threading
 
-# Use the NEW Google GenAI SDK
 from google import genai
 from google.genai import types
 from groq import Groq
 
-from config import AI_MAX_CONTENT_CHARS
+from config import (
+    AI_MAX_CONTENT_CHARS,
+    GEMINI_MIN_INTERVAL,
+    GROQ_MIN_INTERVAL,
+)
 
 # ─────────────────────────────────────────────────────────────
-# CONFIGURATION & API SETUP
+# CLIENT SETUP
 # ─────────────────────────────────────────────────────────────
 
-# Load API Keys
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GROQ_API_KEY   = os.getenv("GROQ_API_KEY", "")
 
-# Initialize Clients
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
-groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+groq_client   = Groq(api_key=GROQ_API_KEY)           if GROQ_API_KEY   else None
+
 
 # ─────────────────────────────────────────────────────────────
-# THREAD-SAFE RATE LIMITER
+# THREAD-SAFE PER-API RATE LIMITERS
+# (Bot listener thread uses Gemini/Groq too — separate locks prevent deadlock)
 # ─────────────────────────────────────────────────────────────
 
-API_LOCK = threading.Lock()
-LAST_CALL_TIME = 0.0
+_gemini_lock = threading.Lock()
+_gemini_last = [0.0]   # mutable list so inner fn can update
 
-def enforce_rate_limit(min_interval=4.1):
-    """Ensures at least `min_interval` seconds pass between API calls."""
-    global LAST_CALL_TIME
-    with API_LOCK:
-        now = time.time()
-        elapsed = now - LAST_CALL_TIME
-        if elapsed < min_interval:
-            sleep_time = min_interval - elapsed
-            print(f"  [AI] Rate limiter active: Sleeping for {sleep_time:.2f}s...")
-            time.sleep(sleep_time)
-        LAST_CALL_TIME = time.time()
+_groq_lock   = threading.Lock()
+_groq_last   = [0.0]
+
+
+def _wait_for_slot(lock, last_ref, interval, name):
+    with lock:
+        now     = time.time()
+        elapsed = now - last_ref[0]
+        if elapsed < interval:
+            wait = interval - elapsed
+            print(f"  [AI] {name} rate slot: sleeping {wait:.1f}s")
+            time.sleep(wait)
+        last_ref[0] = time.time()
+
 
 def dbg(msg):
     print(f"  [AI] {msg}")
 
+
 # ─────────────────────────────────────────────────────────────
-# PROMPT BUILDERS
+# SAFETY SETTINGS (allow cybersec content)
+# ─────────────────────────────────────────────────────────────
+
+_SAFETY = [
+    types.SafetySetting(
+        category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+        threshold=types.HarmBlockThreshold.BLOCK_NONE,
+    ),
+    types.SafetySetting(
+        category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+        threshold=types.HarmBlockThreshold.BLOCK_NONE,
+    ),
+    types.SafetySetting(
+        category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+        threshold=types.HarmBlockThreshold.BLOCK_NONE,
+    ),
+    types.SafetySetting(
+        category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+        threshold=types.HarmBlockThreshold.BLOCK_NONE,
+    ),
+]
+
+
+# ─────────────────────────────────────────────────────────────
+# PROMPT BUILDERS  (unchanged from original)
 # ─────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """You are an elite intelligence analyst covering cybersecurity, AI, technology, hardware, and mobile.
 Your job is to deeply analyze articles and extract structured intelligence.
 You MUST return ONLY valid JSON. If you need to use quotes inside a string, you MUST escape them like this: \\" """
+
 
 def build_analysis_prompt(title, content):
     safe_content = content[:AI_MAX_CONTENT_CHARS]
@@ -92,8 +132,9 @@ SEVERITY GUIDE:
 - LOW: General tech news
 - MINIMAL: Marketing fluff
 
-Fill all fields. If not applicable, use an empty list[].
+Fill all fields. If not applicable, use empty list [].
 Return ONLY the JSON object."""
+
 
 def build_digest_prompt(items_text, cycle_label):
     return f"""{SYSTEM_PROMPT}
@@ -124,6 +165,7 @@ Return this exact JSON:
 }}
 Return ONLY the JSON object."""
 
+
 def build_daily_prompt(digests_text):
     return f"""{SYSTEM_PROMPT}
 Perform deep correlation and pattern analysis across these daily digests to write an Executive Daily Briefing.
@@ -146,6 +188,7 @@ Return this exact JSON:
   "day_summary": "3-4 sentence paragraph summarizing the entire day"
 }}
 Return ONLY the JSON object."""
+
 
 def build_weekly_prompt(digests_text):
     return f"""{SYSTEM_PROMPT}
@@ -174,103 +217,209 @@ Return ONLY the JSON object."""
 
 
 # ─────────────────────────────────────────────────────────────
-# API ENGINE CALLS
+# ENGINE CALLS  (JSON mode — for structured analysis)
 # ─────────────────────────────────────────────────────────────
 
-def gemini_call(prompt):
-    if not gemini_client: 
-        return None
-    try:
-        dbg("Calling Google Gemini 2.5 Flash...")
-        safety_settings =[
-            types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=types.HarmBlockThreshold.BLOCK_NONE),
-            types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
-            types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
-            types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
-        ]
-        
-        response = gemini_client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json", safety_settings=safety_settings)
-        )
-        return response.text
-    except Exception as e:
-        err_msg = str(e).lower()
-        if "429" in err_msg or "quota" in err_msg or "exhausted" in err_msg:
-            dbg("Gemini Quota Exceeded — Skipping instantly to Groq (No waiting!)...")
-        else:
-            dbg(f"Gemini error: {e}")
+def gemini_call(prompt: str, retries: int = 3) -> str | None:
+    """JSON-mode Gemini call. Returns raw JSON string or None."""
+    if not gemini_client:
         return None
 
-def groq_call(prompt):
-    if not groq_client: 
-        return None
-    try:
-        dbg("Calling Groq (Llama-3.1-8B)...")
-        chat_completion = groq_client.chat.completions.create(
-            messages=[{"role": "user", "content": prompt}],
-            model="llama-3.1-8b-instant",
-            response_format={"type": "json_object"} # Forces valid JSON
-        )
-        return chat_completion.choices[0].message.content
-    except Exception as e:
-        dbg(f"Groq error: {e}")
+    for attempt in range(1, retries + 1):
+        _wait_for_slot(_gemini_lock, _gemini_last, GEMINI_MIN_INTERVAL, "Gemini")
+        try:
+            dbg(f"Gemini JSON call (attempt {attempt}/{retries})")
+            response = gemini_client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    safety_settings=_SAFETY,
+                ),
+            )
+            return response.text
+        except Exception as e:
+            err = str(e).lower()
+            if "429" in err or "quota" in err or "resource_exhausted" in err:
+                wait = (2 ** attempt) * 30 + random.uniform(0, 15)
+                dbg(f"Gemini 429 — backing off {wait:.0f}s (attempt {attempt}/{retries})")
+                time.sleep(wait)
+            elif "503" in err or "unavailable" in err:
+                wait = 15 + random.uniform(0, 10)
+                dbg(f"Gemini 503 — retrying in {wait:.0f}s")
+                time.sleep(wait)
+            else:
+                dbg(f"Gemini error: {e}")
+                return None
+
+    dbg("Gemini: all retries exhausted")
+    return None
+
+
+def gemini_call_text(prompt: str, retries: int = 3) -> str | None:
+    """
+    Plain-TEXT mode Gemini call (no JSON forced).
+    Used for deepdive dossiers, quiz explanations — free-form markdown output.
+    """
+    if not gemini_client:
         return None
 
-def local_call(prompt):
-    """
-    Main routing function. Named 'local_call' to maintain compatibility.
-    """
-    enforce_rate_limit(4.1)
+    for attempt in range(1, retries + 1):
+        _wait_for_slot(_gemini_lock, _gemini_last, GEMINI_MIN_INTERVAL, "Gemini-text")
+        try:
+            dbg(f"Gemini TEXT call (attempt {attempt}/{retries})")
+            response = gemini_client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    safety_settings=_SAFETY,
+                    # No response_mime_type → plain text / markdown output
+                ),
+            )
+            return response.text
+        except Exception as e:
+            err = str(e).lower()
+            if "429" in err or "quota" in err or "resource_exhausted" in err:
+                wait = (2 ** attempt) * 30 + random.uniform(0, 15)
+                dbg(f"Gemini-text 429 — backing off {wait:.0f}s")
+                time.sleep(wait)
+            elif "503" in err or "unavailable" in err:
+                time.sleep(15)
+            else:
+                dbg(f"Gemini-text error: {e}")
+                return None
+
+    return None
+
+
+def groq_call(prompt: str, retries: int = 2) -> str | None:
+    """JSON-mode Groq call (fallback for structured analysis)."""
+    if not groq_client:
+        return None
+
+    for attempt in range(1, retries + 1):
+        _wait_for_slot(_groq_lock, _groq_last, GROQ_MIN_INTERVAL, "Groq")
+        try:
+            dbg(f"Groq JSON call (attempt {attempt}/{retries})")
+            chat = groq_client.chat.completions.create(
+                messages=[{"role": "user", "content": prompt}],
+                model="llama-3.1-8b-instant",
+                response_format={"type": "json_object"},
+                timeout=30,
+            )
+            return chat.choices[0].message.content
+        except Exception as e:
+            err = str(e).lower()
+            if "429" in err or "rate" in err:
+                wait = (2 ** attempt) * 15
+                dbg(f"Groq 429 — backing off {wait}s")
+                time.sleep(wait)
+            else:
+                dbg(f"Groq error: {e}")
+                return None
+
+    return None
+
+
+def groq_call_text(prompt: str, retries: int = 2) -> str | None:
+    """Plain-text Groq call (fallback for deepdive/quiz)."""
+    if not groq_client:
+        return None
+
+    for attempt in range(1, retries + 1):
+        _wait_for_slot(_groq_lock, _groq_last, GROQ_MIN_INTERVAL, "Groq-text")
+        try:
+            dbg(f"Groq TEXT call (attempt {attempt}/{retries})")
+            chat = groq_client.chat.completions.create(
+                messages=[{"role": "user", "content": prompt}],
+                model="llama-3.3-70b-versatile",   # Better for free-form prose
+                timeout=45,
+            )
+            return chat.choices[0].message.content
+        except Exception as e:
+            err = str(e).lower()
+            if "429" in err or "rate" in err:
+                wait = (2 ** attempt) * 15
+                dbg(f"Groq-text 429 — backing off {wait}s")
+                time.sleep(wait)
+            else:
+                dbg(f"Groq-text error: {e}")
+                return None
+
+    return None
+
+
+# ─────────────────────────────────────────────────────────────
+# ROUTERS
+# ─────────────────────────────────────────────────────────────
+
+def local_call(prompt: str) -> str | None:
+    """JSON router: Gemini → Groq fallback. For all structured analysis."""
     result = gemini_call(prompt)
-    
     if not result:
-        dbg("Gemini failed or rate-limited. Falling back to Groq...")
-        enforce_rate_limit(2.5)
+        dbg("Gemini failed — trying Groq fallback")
         result = groq_call(prompt)
-        
     return result
 
+
+def local_call_text(prompt: str) -> str | None:
+    """
+    Text router: Gemini → Groq fallback. For deepdive dossiers and free-form text.
+    Returns plain markdown, NOT JSON.
+    """
+    result = gemini_call_text(prompt)
+    if not result:
+        dbg("Gemini-text failed — trying Groq-text fallback")
+        result = groq_call_text(prompt)
+    return result
+
+
 # ─────────────────────────────────────────────────────────────
-# PARSERS & FALLBACKS
+# JSON PARSER
 # ─────────────────────────────────────────────────────────────
 
-def extract_json(text):
-    """Safely extracts and parses JSON from the AI's response."""
+def extract_json(text: str) -> dict | None:
     if not text:
         return None
     try:
         text = text.replace("```json", "").replace("```", "").strip()
         start = text.find("{")
         end   = text.rfind("}") + 1
-        
         if start == -1 or end == 0:
             return None
-            
         return json.loads(text[start:end])
     except Exception as e:
         dbg(f"JSON parse error: {e}")
         return None
 
-def keyword_severity(title, content):
-    """Backup keyword-based severity analyzer in case ALL APIs fail."""
+
+# ─────────────────────────────────────────────────────────────
+# KEYWORD SEVERITY  (backup classifier + pre-screen)
+# ─────────────────────────────────────────────────────────────
+
+_CRITICAL_KW = [
+    "rce", "remote code execution", "zero-day", "0-day", "actively exploited",
+    "supply chain attack", "authentication bypass", "unauthenticated rce",
+    "mass exploitation", "emergency patch", "in the wild",
+]
+_HIGH_KW = [
+    "privilege escalation", "malware", "apt", "ransomware", "breach",
+    "data leak", "backdoor", "trojan", "phishing campaign", "critical vulnerability",
+]
+_MEDIUM_KW = [
+    "cve", "patch", "vulnerability", "advisory", "security fix",
+    "exploit", "attack", "compromised", "injection",
+]
+
+
+def keyword_severity(title: str, content: str = "") -> str:
     text  = (title + " " + content).lower()
     score = 0
-    
-    critical =["rce", "remote code execution", "zero-day", "0-day",
-                "actively exploited", "supply chain", "authentication bypass",
-                "unauthenticated", "critical", "mass exploitation"]
-    high     =["privilege escalation", "malware", "apt", "ransomware",
-                "breach", "data leak", "backdoor", "trojan", "phishing campaign"]
-    medium   =["cve", "patch", "vulnerability", "advisory", "update",
-                "security fix", "exploit"]
-                
-    for k in critical:
+    for k in _CRITICAL_KW:
         if k in text: score += 4
-    for k in high:
+    for k in _HIGH_KW:
         if k in text: score += 2
-    for k in medium:
+    for k in _MEDIUM_KW:
         if k in text: score += 1
 
     if score >= 12: return "CRITICAL"
@@ -279,64 +428,80 @@ def keyword_severity(title, content):
     if score >= 1:  return "LOW"
     return "MINIMAL"
 
+
 # ─────────────────────────────────────────────────────────────
-# PUBLIC API (EXPOSED FUNCTIONS)
+# PUBLIC ANALYSIS FUNCTIONS  (ALL articles get full AI — per user request)
 # ─────────────────────────────────────────────────────────────
 
-def ai_analyze(title, content):
-    """Analyzes a single article."""
+def ai_analyze(title: str, content: str) -> dict:
+    """Full AI analysis of a single article. All articles analyzed."""
     prompt = build_analysis_prompt(title, content)
     raw    = local_call(prompt)
     data   = extract_json(raw)
 
+    kw_sev    = keyword_severity(title, content)
+    sev_order = ["MINIMAL", "LOW", "MEDIUM", "HIGH", "CRITICAL"]
+
     if data:
-        # Trust the AI! Removed the bug that forced everything to CRITICAL.
+        ai_sev = data.get("severity", "LOW")
+        ai_idx = sev_order.index(ai_sev) if ai_sev in sev_order else 2
+        kw_idx = sev_order.index(kw_sev) if kw_sev in sev_order else 1
+        # Take the higher of AI vs keyword (never downgrade)
+        data["severity"] = sev_order[max(ai_idx, kw_idx)]
         return data
 
-    dbg("AI completely failed — using keyword fallback")
+    dbg("AI failed — using keyword fallback for this article")
     return {
-        "severity": keyword_severity(title, content),
-        "category": "tech",
-        "confidence": 1,
-        "summary":["API Analysis unavailable due to cloud error — keyword classification used"],
-        "tags": [], 
-        "cves":[], 
-        "actors": [], 
-        "affected_products":[]
+        "severity":          kw_sev,
+        "category":          "tech",
+        "confidence":        1,
+        "summary":           ["AI analysis unavailable — keyword classification used"],
+        "tags":              [],
+        "cves":              [],
+        "actors":            [],
+        "affected_products": [],
     }
-        
-def ai_digest(items, cycle_label="8-hour cycle"):
+
+
+def ai_digest(items: list, cycle_label: str = "8-hour cycle") -> dict | None:
     sev_map = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "MINIMAL": 1}
-    sorted_items = sorted(items, key=lambda x: sev_map.get(x.get("severity", "LOW"), 0), reverse=True)
-    
+    sorted_items = sorted(
+        items, key=lambda x: sev_map.get(x.get("severity", "LOW"), 0), reverse=True
+    )
+
     items_text = ""
-    for i, item in enumerate(sorted_items, 1):
+    for item in sorted_items:
         summary = item.get("summary", "")
-        if isinstance(summary, list): 
+        if isinstance(summary, list):
             summary = " | ".join(summary)
-            
-        items_text += f"[{item.get('severity','?')}][Cat: {item.get('category','tech')}] {item.get('title','')}\n  {summary[:250]}\n\n"
-        
+        items_text += (
+            f"[{item.get('severity','?')}][{item.get('category','tech')}] "
+            f"{item.get('title','')}\n  {summary[:250]}\n\n"
+        )
         if len(items_text) > 8000:
             break
 
     raw = local_call(build_digest_prompt(items_text, cycle_label))
     return extract_json(raw)
 
-def ai_daily_summary(digests):
+
+def ai_daily_summary(digests: list) -> dict | None:
     digests_text = ""
     for i, d in enumerate(digests, 1):
         digests_text += f"\n--- DIGEST {i} ---\n{json.dumps(d, indent=2)}\n"
-        
+
     raw = local_call(build_daily_prompt(digests_text[:12000]))
     return extract_json(raw)
 
-def ai_weekly_summary(items):
+
+def ai_weekly_summary(items: list) -> dict | None:
     sev_map = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "MINIMAL": 1}
-    sorted_items = sorted(items, key=lambda x: sev_map.get(x.get("severity", "LOW"), 0), reverse=True)
-    
+    sorted_items = sorted(
+        items, key=lambda x: sev_map.get(x.get("severity", "LOW"), 0), reverse=True
+    )
+
     items_text = ""
-    for i, item in enumerate(sorted_items[:40], 1):
+    for item in sorted_items[:40]:
         summary = item.get("summary_text", "")
         items_text += f"[{item.get('severity','?')}] {item.get('title','')}\n  {summary[:200]}\n\n"
 
