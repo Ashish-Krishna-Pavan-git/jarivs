@@ -27,6 +27,7 @@ from telemetry import get_stats as tele_stats
 from storage import load_last_n_hours
 from ai_router import local_call_general_json, local_call_text, extract_json, get_provider_status
 from subscriber_store import load_subscribers, subscribe, unsubscribe
+from runtime_state import load_runtime_state
 
 HF_SPACE_URL = os.getenv("HF_SPACE_URL", "").rstrip("/")
 
@@ -45,15 +46,32 @@ HELP_TEXT = (
     "🤖 JARVIS Commands\n\n"
     "/start - Subscribe this chat to alerts and reports\n"
     "/stop - Unsubscribe this chat\n"
-    "/status - Show queue, cycle, provider, and subscriber status\n"
+    "/status - Show live queue, phase, cycle, provider, and subscriber status\n"
+    "/today - Show today's article and severity summary\n"
+    "/top - Show top high-priority items from the last 24 hours\n"
     "/quiz - Generate an intelligence quiz from recent items\n"
     "/deepdive <topic> - Build a dossier from the last 7 days\n"
     "/limits - Show Groq and Gemini usage/cooldown status\n"
     "/help - Show this help message\n\n"
+    "Schedule (IST):\n"
+    "- 7:00 AM: Daily summary + newsletter\n"
+    "- 8:00 AM: Cycle 1 digest\n"
+    "- 3:00 PM: Cycle 2 digest\n"
+    "- 9:00 PM: Cycle 3 digest\n\n"
     "Tips:\n"
     "- In groups, use commands like /status@YourBotName if needed.\n"
     "- For best control, talk to the bot in a private chat first with /start."
 )
+
+MAIN_KEYBOARD = {
+    "keyboard": [
+        [{"text": "/status"}, {"text": "/today"}, {"text": "/top"}],
+        [{"text": "/quiz"}, {"text": "/limits"}],
+        [{"text": "/deepdive ransomware"}, {"text": "/help"}],
+    ],
+    "resize_keyboard": True,
+    "is_persistent": True,
+}
 
 
 def _normalize_command(text: str) -> tuple[str, str]:
@@ -86,6 +104,8 @@ def register_bot_commands():
         {"command": "start", "description": "Subscribe this chat"},
         {"command": "stop", "description": "Unsubscribe this chat"},
         {"command": "status", "description": "System and provider status"},
+        {"command": "today", "description": "Today's article summary"},
+        {"command": "top", "description": "Top high-priority items"},
         {"command": "quiz", "description": "Generate an intel quiz"},
         {"command": "deepdive", "description": "Research a topic from recent data"},
         {"command": "limits", "description": "Show API cooldown and quota status"},
@@ -97,35 +117,56 @@ def register_bot_commands():
         print(f"[BOT] setMyCommands failed: {e}")
 
 
-def send_reply(chat_id, text):
-    """Send reply to one chat. Session handles retries automatically."""
+def send_reply(chat_id, text, reply_markup=None):
+    """Send reply to one chat with stronger retry handling for HF Spaces."""
     if not TELEGRAM_TOKEN:
         return
-    url   = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    MAX   = 4000
-    text  = str(text)
-    parts = [text[i:i+MAX] for i in range(0, len(text), MAX)] if len(text) > MAX else [text]
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    max_len = 4000
+    text = str(text)
+    parts = [text[i:i+max_len] for i in range(0, len(text), max_len)] if len(text) > max_len else [text]
 
-    for chunk in parts:
+    for chunk_index, chunk in enumerate(parts, 1):
         sent = False
         for parse_mode in ["Markdown", None]:
             payload = {"chat_id": chat_id, "text": chunk}
             if parse_mode:
                 payload["parse_mode"] = parse_mode
-            try:
-                r = _session.post(url, json=payload, timeout=30)
-                if r.status_code == 200:
-                    sent = True
+            if reply_markup and chunk_index == 1:
+                payload["reply_markup"] = reply_markup
+            for attempt in range(1, 4):
+                try:
+                    r = _session.post(url, json=payload, timeout=60)
+                    if r.status_code == 200:
+                        sent = True
+                        break
+                    if r.status_code == 400 and parse_mode == "Markdown":
+                        break
+                    if r.status_code == 429:
+                        retry_after = r.json().get("parameters", {}).get("retry_after", 10)
+                        print(f"[BOT] Reply rate limited — waiting {retry_after}s")
+                        time.sleep(retry_after)
+                        continue
+                    if r.status_code in (500, 502, 503, 504):
+                        wait = attempt * 5
+                        print(f"[BOT] Reply HTTP {r.status_code}, retrying in {wait}s")
+                        time.sleep(wait)
+                        continue
+                    print(f"[BOT] Reply HTTP {r.status_code}: {r.text[:120]}")
                     break
-                elif r.status_code == 400 and parse_mode == "Markdown":
-                    continue  # Retry without markdown
-                else:
-                    print(f"[BOT] Reply HTTP {r.status_code}: {r.text[:60]}")
+                except requests.exceptions.ReadTimeout:
+                    wait = attempt * 5
+                    print(f"[BOT] Reply read timeout, retrying in {wait}s")
+                    time.sleep(wait)
+                except requests.exceptions.ConnectionError as e:
+                    wait = attempt * 5
+                    print(f"[BOT] Reply connection error: {e}; retrying in {wait}s")
+                    time.sleep(wait)
+                except Exception as e:
+                    print(f"[BOT] Reply error: {e}")
                     break
-            except Exception as e:
-                print(f"[BOT] Reply error: {e}")
-                if parse_mode is None:
-                    time.sleep(2)
+            if sent:
+                break
         if not sent:
             print(f"[BOT] Failed to send reply to {chat_id}")
         time.sleep(0.2)
@@ -235,6 +276,45 @@ Return ONLY this JSON:
         send_reply(chat_id, "⚠️ AI failed to format quiz. Try `/quiz` again.")
 
 
+def _today_summary_text():
+    items = load_last_n_hours(24)
+    if not items:
+        return "📭 No processed articles in the last 24 hours yet."
+
+    counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "MINIMAL": 0}
+    for item in items:
+        severity = item.get("severity", "LOW")
+        counts[severity] = counts.get(severity, 0) + 1
+
+    return "\n".join([
+        "🗓 Today So Far",
+        f"📦 Total articles: {len(items)}",
+        f"🚨 Critical: {counts.get('CRITICAL', 0)}",
+        f"⚠️ High: {counts.get('HIGH', 0)}",
+        f"📌 Medium: {counts.get('MEDIUM', 0)}",
+        f"📄 Low: {counts.get('LOW', 0)}",
+        f"ℹ️ Minimal: {counts.get('MINIMAL', 0)}",
+    ])
+
+
+def _top_items_text():
+    items = load_last_n_hours(24)
+    if not items:
+        return "📭 No processed articles in the last 24 hours yet."
+
+    severity_rank = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "MINIMAL": 1}
+    top_items = sorted(
+        items,
+        key=lambda item: (severity_rank.get(item.get("severity", "LOW"), 0), item.get("confidence", 0)),
+        reverse=True,
+    )[:8]
+
+    lines = ["🔥 Top Items (Last 24h)"]
+    for item in top_items:
+        lines.append(f"• [{item.get('severity', 'LOW')}] {str(item.get('title', ''))[:120]}")
+    return "\n".join(lines)
+
+
 def handle_message(text, chat_id, first_name):
     cmd, args = _normalize_command(text)
     subs = load_subscribers()
@@ -246,12 +326,16 @@ def handle_message(text, chat_id, first_name):
             "🟢 *You are now SUBSCRIBED to intelligence alerts.*\n\n"
             "📋 *Commands:*\n"
             "• /status — System health\n"
+            "• /today — Today's totals\n"
+            "• /top — Top priority items\n"
             "• /quiz — Daily intel quiz\n"
             "• /deepdive topic — Research dossier\n"
             "• /limits — API quota and cooldown status\n"
             "• /help — Full usage guide\n"
             "• /stop — Unsubscribe\n\n"
-            "🤖 CRITICAL/HIGH alerts are immediate. Cycle, daily, and weekly reports stay subscribed.")
+            "🕒 Schedule: Daily at 7:00 AM IST, cycles at 8:00 AM, 3:00 PM, and 9:00 PM IST.\n\n"
+            "🤖 CRITICAL/HIGH alerts are immediate. Cycle, daily, and weekly reports stay subscribed.",
+            reply_markup=MAIN_KEYBOARD)
 
     elif cmd == "/stop":
         unsubscribe(chat_id)
@@ -260,6 +344,7 @@ def handle_message(text, chat_id, first_name):
     elif cmd == "/status":
         qs  = queue_stats()
         ts  = tele_stats()
+        rt  = load_runtime_state()
         sev = " | ".join(f"{k}:{v}" for k, v in ts.get("by_severity", {}).items() if v > 0) or "none yet"
         mode = "webhook" if HF_SPACE_URL else "polling"
         providers = get_provider_status()
@@ -269,18 +354,25 @@ def handle_message(text, chat_id, first_name):
             f"📊 *JARVIS Status*\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"👥 Subscribers: {len(subs)}\n"
+            f"⚙️ Phase: {rt.get('phase', 'idle')}\n"
+            f"🔁 Cycle #: {rt.get('current_cycle_number', 0)}\n"
+            f"🕒 Current slot: {rt.get('current_cycle_slot') or 'not running'}\n"
+            f"⏭ Next cycle: {rt.get('next_cycle_at_ist') or 'not scheduled'}\n"
+            f"🧾 Current item: {rt.get('current_item_title', '')[:80] or 'n/a'}\n"
             f"📥 Queue: {qs.get('pending', 0)} pending\n"
+            f"📦 Runtime progress: {rt.get('queue_done', 0)}/{rt.get('queue_total', 0)} done | failed {rt.get('queue_failed', 0)}\n"
             f"✅ Processed: {ts.get('total_processed', 0)} total\n"
             f"🔄 Cycles: {ts.get('cycles_run', 0)}\n"
             f"📈 By severity: {sev}\n"
             f"🕐 Last cycle: {ts.get('last_cycle_at', 'never')}\n"
+            f"🌅 Last daily run: {rt.get('last_daily_run_ist') or 'not yet'}\n"
             f"📡 Mode: {mode}\n\n"
             f"🔌 Providers:\n"
             f"• {groq_line}\n"
             f"• {gemini_line}")
 
     elif cmd == "/help":
-        send_reply(chat_id, HELP_TEXT)
+        send_reply(chat_id, HELP_TEXT, reply_markup=MAIN_KEYBOARD)
 
     elif cmd == "/limits":
         providers = get_provider_status()
@@ -296,9 +388,16 @@ def handle_message(text, chat_id, first_name):
             f"Gemini\n"
             f"• State: {gemini.get('state', 'unknown')}\n"
             f"• Hour/Day: {gemini.get('usage', {}).get('hour', 0)}/{gemini.get('usage', {}).get('day', 0)}\n"
-            f"• Synthesis today: {gemini.get('usage', {}).get('synthesis_day', 0)}\n"
+            f"• Cycle today: {gemini.get('usage', {}).get('cycle_day', 0)}\n"
+            f"• Priority today: {gemini.get('usage', {}).get('priority_day', 0)}\n"
             f"• Blocked until: {gemini.get('blocked_until') or 'ready'}\n"
         )
+
+    elif cmd == "/today":
+        send_reply(chat_id, _today_summary_text())
+
+    elif cmd == "/top":
+        send_reply(chat_id, _top_items_text())
 
     elif cmd == "/quiz":
         threading.Thread(target=execute_quiz, args=(chat_id,), daemon=True).start()
@@ -310,10 +409,10 @@ def handle_message(text, chat_id, first_name):
             send_reply(chat_id, "⚠️ Usage: `/deepdive <topic>`\nExample: `/deepdive Ransomware`")
 
     elif cmd.startswith("/"):
-        send_reply(chat_id, HELP_TEXT)
+        send_reply(chat_id, HELP_TEXT, reply_markup=MAIN_KEYBOARD)
 
     elif text and text.strip().lower() in {"help", "commands", "menu"}:
-        send_reply(chat_id, HELP_TEXT)
+        send_reply(chat_id, HELP_TEXT, reply_markup=MAIN_KEYBOARD)
 
 
 def handle_update(update):
@@ -332,6 +431,7 @@ def handle_update(update):
         user  = msg.get("from", {})
         fname = user.get("first_name") or chat.get("title") or "Agent"
         if text and cid:
+            print(f"[BOT] Incoming from {cid}: {text[:120]}")
             handle_message(text, str(cid), fname)
     except Exception as e:
         print(f"[BOT] handle_update error: {e}")
@@ -345,7 +445,7 @@ def _poll_loop():
     print("[BOT] Polling loop started")
     while True:
         try:
-            params = {"timeout": 20, "allowed_updates": ["message"]}
+            params = {"timeout": 20, "allowed_updates": ["message", "channel_post", "edited_message", "edited_channel_post"]}
             if offset:
                 params["offset"] = offset
             r = _session.get(url, params=params, timeout=30)

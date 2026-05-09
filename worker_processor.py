@@ -15,6 +15,7 @@ from notifier       import notify_immediate
 from telemetry      import update as tele_update
 from dedupe         import mark_as_seen
 from config         import IMMEDIATE_ALERT_LEVELS
+from runtime_state  import update_runtime_state
 
 
 # ─────────────────────────────────────────────────────────────
@@ -124,6 +125,7 @@ def is_dead_serious(item: dict) -> bool:
 def process_item(item: dict) -> dict:
     article = item.get("article", {})
     title   = str(article.get("title", "Unknown Title"))
+    update_runtime_state(current_item_title=title)
 
     print(f"\n  [PROC] {title[:70]}")
     print(f"  [PROC] Source: {article.get('source', '?')}")
@@ -213,6 +215,7 @@ def run_worker():
     failed_all    = []
     total         = get_pending_count()
     done          = 0
+    update_runtime_state(queue_total=total, queue_done=0, queue_failed=0, phase="processing")
 
     while True:
         item = get_next_item()
@@ -229,6 +232,7 @@ def run_worker():
             processed_all.append(result)
             mark_done(item["id"])
             mark_as_seen([article])   # In-memory only — no disk write per article
+            update_runtime_state(queue_done=len(processed_all), queue_failed=len(failed_all))
 
         except Exception as e:
             print(f"[WORKER] ⚠️ Error on item: {e}")
@@ -236,6 +240,7 @@ def run_worker():
             tele_update("failed")
             mark_failed(item["id"])
             failed_all.append(item)
+            update_runtime_state(queue_done=len(processed_all), queue_failed=len(failed_all))
 
         time.sleep(0.5)   # Small gap between articles (rate limiter handles AI waits)
 

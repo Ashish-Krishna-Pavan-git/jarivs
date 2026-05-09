@@ -36,6 +36,7 @@ from config import (
     GROQ_MIN_INTERVAL,
     GEMINI_SYNTHESIS_MODEL,
     GEMINI_FALLBACK_MODEL,
+    GEMINI_GENERAL_MODEL,
     GROQ_ARTICLE_MODEL,
     GROQ_ARTICLE_FALLBACK_MODEL,
     GROQ_SYNTHESIS_MODEL,
@@ -43,6 +44,7 @@ from config import (
     GEMINI_SYNTHESIS_HOURLY_LIMIT,
     GEMINI_SYNTHESIS_DAILY_LIMIT,
     GEMINI_SYNTHESIS_WEEKLY_LIMIT,
+    GEMINI_PRIORITY_RESERVED_SLOTS,
     GEMINI_GENERAL_HOURLY_LIMIT,
     GEMINI_GENERAL_DAILY_LIMIT,
     GEMINI_COOLDOWN_429_SECONDS,
@@ -86,7 +88,7 @@ ARTICLE_GROQ_MODELS = _uniq([GROQ_ARTICLE_MODEL, GROQ_ARTICLE_FALLBACK_MODEL, GR
 SYNTHESIS_GROQ_MODELS = _uniq([GROQ_SYNTHESIS_MODEL, GROQ_ARTICLE_FALLBACK_MODEL, GROQ_ARTICLE_MODEL])
 TEXT_GROQ_MODELS = _uniq([GROQ_TEXT_MODEL, GROQ_SYNTHESIS_MODEL, GROQ_ARTICLE_FALLBACK_MODEL, GROQ_ARTICLE_MODEL])
 SYNTHESIS_GEMINI_MODELS = _uniq([GEMINI_SYNTHESIS_MODEL, GEMINI_FALLBACK_MODEL])
-GENERAL_GEMINI_MODELS = _uniq([GEMINI_FALLBACK_MODEL, GEMINI_SYNTHESIS_MODEL])
+GENERAL_GEMINI_MODELS = _uniq([GEMINI_GENERAL_MODEL, GEMINI_FALLBACK_MODEL, GEMINI_SYNTHESIS_MODEL])
 
 
 def _default_provider_state():
@@ -96,7 +98,8 @@ def _default_provider_state():
             "last_error": "",
             "usage": {
                 "all": [],
-                "synthesis": [],
+                "cycle": [],
+                "priority": [],
                 "general": [],
             },
         },
@@ -243,13 +246,24 @@ def _quota_reason(provider, bucket):
 
     counts = _bucket_counts(provider, bucket)
 
-    if provider == "gemini" and bucket == "synthesis":
-        if counts["hour"] >= GEMINI_SYNTHESIS_HOURLY_LIMIT:
+    if provider == "gemini" and bucket in {"cycle", "priority"}:
+        cycle_usage = state[provider]["usage"].get("cycle", [])
+        priority_usage = state[provider]["usage"].get("priority", [])
+        synthesis_usage = _prune_usage(cycle_usage + priority_usage, now)
+        synth_hour = _count_recent(synthesis_usage, now, 3600)
+        synth_day = _count_recent(synthesis_usage, now, 86400)
+        synth_week = _count_recent(synthesis_usage, now, 7 * 86400)
+
+        if synth_hour >= GEMINI_SYNTHESIS_HOURLY_LIMIT:
             return False, "synthesis hourly budget exhausted"
-        if counts["day"] >= GEMINI_SYNTHESIS_DAILY_LIMIT:
+        if synth_day >= GEMINI_SYNTHESIS_DAILY_LIMIT:
             return False, "synthesis daily budget exhausted"
-        if counts["week"] >= GEMINI_SYNTHESIS_WEEKLY_LIMIT:
+        if synth_week >= GEMINI_SYNTHESIS_WEEKLY_LIMIT:
             return False, "synthesis weekly budget exhausted"
+        if bucket == "cycle":
+            usable_daily_limit = max(0, GEMINI_SYNTHESIS_DAILY_LIMIT - GEMINI_PRIORITY_RESERVED_SLOTS)
+            if synth_day >= usable_daily_limit:
+                return False, "cycle budget exhausted; reserved Gemini slots kept for daily/weekly intelligence"
 
     if provider == "gemini" and bucket == "general":
         if counts["hour"] >= GEMINI_GENERAL_HOURLY_LIMIT:
@@ -655,7 +669,7 @@ def ai_digest(items: list, cycle_label: str = "8-hour cycle") -> dict | None:
         if len(items_text) > 8000:
             break
 
-    raw = local_call(build_digest_prompt(items_text, cycle_label))
+    raw = local_call(build_digest_prompt(items_text, cycle_label), purpose="cycle")
     return extract_json(raw)
 
 
@@ -664,7 +678,7 @@ def ai_daily_summary(digests: list) -> dict | None:
     for idx, digest in enumerate(digests, 1):
         digests_text += f"\n--- DIGEST {idx} ---\n{json.dumps(digest, indent=2)}\n"
 
-    raw = local_call(build_daily_prompt(digests_text[:12000]))
+    raw = local_call(build_daily_prompt(digests_text[:12000]), purpose="daily")
     return extract_json(raw)
 
 
@@ -676,20 +690,21 @@ def ai_weekly_summary(items: list) -> dict | None:
     for item in sorted_items[:40]:
         items_text += f"[{item.get('severity', '?')}] {item.get('title', '')}\n  {item.get('summary_text', '')[:200]}\n\n"
 
-    raw = local_call(build_weekly_prompt(items_text[:12000]))
+    raw = local_call(build_weekly_prompt(items_text[:12000]), purpose="weekly")
     return extract_json(raw)
 
 
-def local_call(prompt: str) -> str | None:
+def local_call(prompt: str, purpose: str = "cycle") -> str | None:
     """
     Scheduled synthesis router.
     Gemini is reserved here for 8h, daily, weekly, and newsletter-quality output.
     """
-    result = _gemini_call(prompt, SYNTHESIS_GEMINI_MODELS, bucket="synthesis", json_mode=True)
+    bucket = "priority" if purpose in {"daily", "weekly", "newsletter"} else "cycle"
+    result = _gemini_call(prompt, SYNTHESIS_GEMINI_MODELS, bucket=bucket, json_mode=True)
     if result:
         return result
 
-    dbg("Gemini synthesis unavailable — falling back to Groq synthesis")
+    dbg(f"Gemini {purpose} synthesis unavailable — falling back to Groq synthesis")
     return _groq_json_call(prompt, SYNTHESIS_GROQ_MODELS)
 
 
@@ -729,7 +744,8 @@ def get_provider_status() -> dict:
     now = time.time()
 
     gemini_counts = _bucket_counts("gemini", "general")
-    gemini_synth_counts = _bucket_counts("gemini", "synthesis")
+    gemini_cycle_counts = _bucket_counts("gemini", "cycle")
+    gemini_priority_counts = _bucket_counts("gemini", "priority")
     groq_counts = _bucket_counts("groq", "all")
 
     def provider_state(provider_name, blocked_until, last_error, usage):
@@ -756,9 +772,10 @@ def get_provider_status() -> dict:
                 "hour": gemini_counts["hour"],
                 "day": gemini_counts["day"],
                 "week": gemini_counts["week"],
-                "synthesis_hour": gemini_synth_counts["hour"],
-                "synthesis_day": gemini_synth_counts["day"],
-                "synthesis_week": gemini_synth_counts["week"],
+                "cycle_hour": gemini_cycle_counts["hour"],
+                "cycle_day": gemini_cycle_counts["day"],
+                "priority_hour": gemini_priority_counts["hour"],
+                "priority_day": gemini_priority_counts["day"],
             },
         ),
         "groq": provider_state(
