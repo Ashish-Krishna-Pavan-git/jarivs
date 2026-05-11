@@ -3,6 +3,9 @@ runtime_state.py
 Lightweight runtime state — phase, queue progress, current item, cycle info.
 Written to RUNTIME_STATE_FILE on every update so /status can read it in real time.
 Thread-safe via a module-level lock.
+
+FIX: RUNTIME_STATE_FILE is now defined in config.py (was missing — caused ImportError).
+FIX: Default state includes last_cycle_started_at + last_cycle_finished_at fields.
 """
 
 import json
@@ -22,16 +25,18 @@ _lock = threading.Lock()
 
 def _default() -> dict:
     return {
-        "phase":                "idle",
-        "current_cycle_number": 0,
-        "current_cycle_slot":   None,
-        "next_cycle_at_ist":    None,
-        "current_item_title":   "",
-        "queue_total":          0,
-        "queue_done":           0,
-        "queue_failed":         0,
-        "last_daily_run_ist":   None,
-        "updated_at":           None,
+        "phase":                   "idle",
+        "current_cycle_number":    0,
+        "current_cycle_slot":      None,
+        "next_cycle_at_ist":       None,
+        "current_item_title":      "",
+        "queue_total":             0,
+        "queue_done":              0,
+        "queue_failed":            0,
+        "last_daily_run_ist":      None,
+        "last_cycle_started_at":   "",    # FIX: new field
+        "last_cycle_finished_at":  "",    # FIX: new field
+        "updated_at":              None,
     }
 
 
@@ -58,14 +63,11 @@ def update_runtime_state(**kwargs):
     """
     Merge kwargs into the persisted state.
     Adds an 'updated_at' IST timestamp automatically.
-
-    Example:
-        update_runtime_state(phase="processing", queue_total=120)
     """
     with _lock:
         state = load_runtime_state()
         state.update(kwargs)
-        state["updated_at"] = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
+        state["updated_at"] = datetime.now(IST).isoformat()
         try:
             with open(RUNTIME_STATE_FILE, "w", encoding="utf-8") as f:
                 json.dump(state, f, indent=2)

@@ -10,7 +10,7 @@ import json
 from datetime import datetime
 
 from storage   import load_last_n_hours, load_today_digests, save_daily_report
-from ai_router import ai_daily_summary, ai_weekly_summary, ai_digest
+from ai_router import ai_daily_summary, ai_weekly_summary
 from notifier  import send_daily_summary, send_weekly_summary
 from intelligence import trend_analysis, severity_breakdown, top_by_severity, source_breakdown
 
@@ -44,10 +44,7 @@ def run_daily_summary():
         print("[DAILY] Running AI cross-cycle correlation...")
         ai_summary = ai_daily_summary(digests)
     else:
-        print("[DAILY] No digests found — rebuilding a fallback AI digest from last 24h")
-        fallback_digest = ai_digest(all_items, "Daily fallback")
-        if fallback_digest:
-            ai_summary = ai_daily_summary([fallback_digest])
+        print("[DAILY] No digests found — AI daily skipped (will still send stats)")
 
     # ── Build stats ──
     breakdown = severity_breakdown(all_items)

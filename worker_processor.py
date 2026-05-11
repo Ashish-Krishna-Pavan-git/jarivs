@@ -2,6 +2,9 @@
 worker_processor.py
 Core processing engine.
 Handles AI analysis, normalization, saving, and immediate alerts.
+
+FIX: normalize_category now splits on '|' and returns the first valid token.
+     Previously, AI returning "cybersec|malware|ai|tech" was stored verbatim.
 """
 
 import time
@@ -15,7 +18,11 @@ from notifier       import notify_immediate
 from telemetry      import update as tele_update
 from dedupe         import mark_as_seen
 from config         import IMMEDIATE_ALERT_LEVELS
-from runtime_state  import update_runtime_state
+
+# Valid single-value categories (matches AI prompt instruction)
+_VALID_CATEGORIES = {
+    "cybersec", "ai", "tech", "mobile", "hardware", "newsletter", "business"
+}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -23,12 +30,26 @@ from runtime_state  import update_runtime_state
 # ─────────────────────────────────────────────────────────────
 
 def normalize_category(cat) -> str:
+    """
+    FIX: AI sometimes returns pipe-separated categories e.g. 'cybersec|malware|ai|tech'.
+    We now split on '|', ',', '/', or space and return the first recognised token.
+    Falls back to 'tech' if nothing matches.
+    """
     try:
         if isinstance(cat, list):
-            return str(cat[0]).lower().strip() if cat else "tech"
-        if isinstance(cat, str):
-            return cat.lower().strip()
-        return "tech"
+            cat = cat[0] if cat else "tech"
+        raw = str(cat).lower().strip()
+
+        # Split on common separators the AI uses incorrectly
+        import re
+        tokens = re.split(r"[|,/\s]+", raw)
+        for token in tokens:
+            token = token.strip()
+            if token in _VALID_CATEGORIES:
+                return token
+
+        # Return the first token even if not in the known set (better than empty)
+        return tokens[0].strip() if tokens and tokens[0].strip() else "tech"
     except Exception:
         return "tech"
 
@@ -125,12 +146,11 @@ def is_dead_serious(item: dict) -> bool:
 def process_item(item: dict) -> dict:
     article = item.get("article", {})
     title   = str(article.get("title", "Unknown Title"))
-    update_runtime_state(current_item_title=title)
 
     print(f"\n  [PROC] {title[:70]}")
     print(f"  [PROC] Source: {article.get('source', '?')}")
 
-    # ── 1. Scrape full content ──
+    # 1. Scrape full content
     article = scrape_article(article)
     content = str(article.get("content", ""))
 
@@ -140,7 +160,7 @@ def process_item(item: dict) -> dict:
     else:
         print(f"  [PROC] RSS fallback: {len(content)} chars")
 
-    # ── 2. AI analysis (all articles) ──
+    # 2. AI analysis
     print(f"  [PROC] Running AI analysis...")
     ai_data = ai_analyze(title, content)
 
@@ -152,9 +172,9 @@ def process_item(item: dict) -> dict:
             "confidence": 1,
         }
 
-    # ── 3. Normalize AI output ──
+    # 3. Normalize AI output
     severity = str(ai_data.get("severity", "LOW")).upper()
-    category = normalize_category(ai_data.get("category", "tech"))
+    category = normalize_category(ai_data.get("category", "tech"))   # FIX: splits pipes
     summary  = normalize_summary(ai_data.get("summary", []))
     tags     = normalize_list_field(ai_data.get("tags", []))
     cves     = normalize_list_field(ai_data.get("cves", []))
@@ -168,7 +188,7 @@ def process_item(item: dict) -> dict:
 
     summary_text = "\n".join(f"• {s}" for s in summary)
 
-    # ── 4. Build processed record ──
+    # 4. Build processed record
     processed = {
         "title":             title,
         "link":              str(article.get("link", "")),
@@ -190,16 +210,16 @@ def process_item(item: dict) -> dict:
 
     print(f"  [PROC] ✓ {severity} | {category} | confidence={confidence}")
 
-    # ── 5. Save to disk ──
+    # 5. Save to disk
     save_article(processed)
     tele_update("processed", severity=severity)
 
-    # ── 6. Immediate alert for genuinely critical events ──
+    # 6. Immediate alert for genuinely critical events
     if is_dead_serious(processed):
         print(f"  [PROC] 🚨 DEAD SERIOUS — sending immediate alert")
         notify_immediate(processed)   # Non-blocking (background thread)
     elif severity in IMMEDIATE_ALERT_LEVELS:
-        print(f"  [PROC] {severity} — will appear in 8hr digest (cooldown active or not urgent enough)")
+        print(f"  [PROC] {severity} — will appear in 8hr digest (not urgent enough for immediate)")
 
     return processed
 
@@ -215,7 +235,6 @@ def run_worker():
     failed_all    = []
     total         = get_pending_count()
     done          = 0
-    update_runtime_state(queue_total=total, queue_done=0, queue_failed=0, phase="processing")
 
     while True:
         item = get_next_item()
@@ -231,8 +250,7 @@ def run_worker():
             result = process_item(item)
             processed_all.append(result)
             mark_done(item["id"])
-            mark_as_seen([article])   # In-memory only — no disk write per article
-            update_runtime_state(queue_done=len(processed_all), queue_failed=len(failed_all))
+            mark_as_seen([article])   # In-memory only — flushed once at end
 
         except Exception as e:
             print(f"[WORKER] ⚠️ Error on item: {e}")
@@ -240,12 +258,10 @@ def run_worker():
             tele_update("failed")
             mark_failed(item["id"])
             failed_all.append(item)
-            update_runtime_state(queue_done=len(processed_all), queue_failed=len(failed_all))
 
-        time.sleep(0.5)   # Small gap between articles (rate limiter handles AI waits)
+        time.sleep(0.5)
 
     print(f"\n[WORKER] ✓ Complete: {len(processed_all)} processed, {len(failed_all)} failed")
-    # Flush seen fingerprints to disk ONCE (not per-article — huge speed improvement)
     from dedupe import flush_seen
     flush_seen()
     return processed_all, failed_all

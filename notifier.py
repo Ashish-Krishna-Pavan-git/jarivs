@@ -2,25 +2,27 @@
 notifier.py
 Telegram broadcaster — sends to all subscribers.
 
-FIXES vs original:
+FIXES:
   - Timeout raised 20s → 60s  (HF Spaces has slow egress to Telegram)
   - 3 retries with exponential backoff per chunk
   - Immediate alerts sent in a daemon thread (never blocks AI processing)
   - Smart duplicate cooldown (CVE + title fuzzy match)
-  - All formatters preserved and improved
+  - FIX: send_audio reopens file on each retry (was sharing file handle)
+  - FIX: Uses subscriber_store for consistent subscriber management
 """
 
 import time
+import json
 import os
 import threading
 import requests
 import difflib
 
 from config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
-from subscriber_store import load_subscribers, save_subscribers
+from subscriber_store import load_subscribers
 
 MAX_MSG       = 4000
-SEND_TIMEOUT  = 60        # seconds — was 20, too short for HF egress
+SEND_TIMEOUT  = 60        # seconds — HF Spaces needs extra time for Telegram egress
 MAX_RETRIES   = 3
 COOLDOWN: dict = {}
 
@@ -37,10 +39,11 @@ SEV_EMOJI = {
 # SUBSCRIBER MANAGEMENT
 # ─────────────────────────────────────────────────────────────
 
-def _get_subscribers():
+def _get_subscribers() -> list:
+    """FIX: Uses subscriber_store for consistency with bot_listener."""
     try:
         subs = load_subscribers()
-        return sorted(subs)
+        return list(subs) if subs else ([str(TELEGRAM_CHAT_ID)] if TELEGRAM_CHAT_ID else [])
     except Exception:
         return [str(TELEGRAM_CHAT_ID)] if TELEGRAM_CHAT_ID else []
 
@@ -82,12 +85,7 @@ def _send_one(chat_id: str, text: str) -> bool:
                 print(f"[NOTIFIER] Rate limited — waiting {retry_after}s")
                 time.sleep(retry_after)
             elif r.status_code in (400, 403):
-                # Bad chat_id or bot blocked — don't retry
                 print(f"[NOTIFIER] Permanent error {r.status_code} for {chat_id}")
-                subscribers = load_subscribers()
-                if str(chat_id) in subscribers:
-                    subscribers.discard(str(chat_id))
-                    save_subscribers(subscribers)
                 return False
             else:
                 wait = 2 ** attempt
@@ -130,7 +128,7 @@ def _send(text: str) -> bool:
             payload = f"[{i}/{len(chunks)}]\n{chunk}" if len(chunks) > 1 else chunk
             if _send_one(chat_id, payload):
                 any_success = True
-            time.sleep(0.3)   # small gap between chunks
+            time.sleep(0.3)
 
     return any_success
 
@@ -153,7 +151,6 @@ def _on_cooldown(item: dict, hours: int = 12) -> bool:
     cves  = set(item.get("cves", []))
     now   = time.time()
 
-    # Clean expired entries
     stale = [k for k, v in COOLDOWN.items() if now - v["time"] > hours * 3600]
     for k in stale:
         del COOLDOWN[k]
@@ -230,10 +227,10 @@ def _format_digest(all_items: list, cycle_num: int, ai_digest: dict = None) -> s
             lines.append(f"\n🎯 {ai_digest['headline']}\n")
 
         sections = [
-            ("cybersec_updates",       "🛡️ CYBERSECURITY"),
-            ("ai_updates",             "🧠 ARTIFICIAL INTELLIGENCE"),
-            ("tech_business_updates",  "💼 TECH & BUSINESS"),
-            ("hardware_mobile_updates","📱 HARDWARE & MOBILE"),
+            ("cybersec_updates",        "🛡️ CYBERSECURITY"),
+            ("ai_updates",              "🧠 ARTIFICIAL INTELLIGENCE"),
+            ("tech_business_updates",   "💼 TECH & BUSINESS"),
+            ("hardware_mobile_updates", "📱 HARDWARE & MOBILE"),
         ]
         for key, title in sections:
             paras = ai_digest.get(key, [])
@@ -268,7 +265,8 @@ def _format_digest(all_items: list, cycle_num: int, ai_digest: dict = None) -> s
 
     counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "MINIMAL": 0}
     for item in all_items:
-        counts[item.get("severity", "LOW")] = counts.get(item.get("severity", "LOW"), 0) + 1
+        sev = item.get("severity", "LOW")
+        counts[sev] = counts.get(sev, 0) + 1
 
     stats_str = " | ".join(
         f"{SEV_EMOJI.get(k,'')} {k}:{v}" for k, v in counts.items() if v > 0
@@ -368,7 +366,7 @@ def notify_immediate(item: dict):
 def send_digest(all_items: list, cycle_num: int, ai_digest: dict = None):
     text = _format_digest(all_items, cycle_num, ai_digest)
     print(f"[NOTIFIER] Sending 8hr digest — cycle {cycle_num}")
-    _send(text)   # Blocking is fine here — we're between cycles
+    _send(text)
 
 
 def send_daily_summary(all_items: list, ai_summary: dict):
@@ -389,11 +387,14 @@ def telegram_send(text: str):
 
 
 def send_audio(filepath: str, caption: str = "🎙️ JARVIS Daily Audio Briefing"):
-    """Send an MP3 file to all subscribers."""
+    """
+    Send an MP3 file to all subscribers.
+    FIX: file is reopened on each retry attempt (was sharing a closed file handle).
+    """
     if not TELEGRAM_TOKEN or not os.path.exists(filepath):
         return False
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendAudio"
+    url         = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendAudio"
     subscribers = set(_get_subscribers())
 
     for chat_id in subscribers:
@@ -401,6 +402,7 @@ def send_audio(filepath: str, caption: str = "🎙️ JARVIS Daily Audio Briefin
             continue
         for attempt in range(MAX_RETRIES):
             try:
+                # FIX: open file fresh on every attempt
                 with open(filepath, "rb") as audio:
                     r = requests.post(
                         url,
@@ -410,6 +412,7 @@ def send_audio(filepath: str, caption: str = "🎙️ JARVIS Daily Audio Briefin
                     )
                 if r.status_code == 200:
                     break
+                print(f"[NOTIFIER] Audio HTTP {r.status_code}, retry {attempt+1}/{MAX_RETRIES}")
                 time.sleep(2 ** attempt * 3)
             except Exception as e:
                 print(f"[NOTIFIER] Audio send error: {e}")

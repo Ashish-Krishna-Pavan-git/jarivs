@@ -3,17 +3,16 @@ scheduler.py
 JARVIS main orchestrator — runs intelligence cycles and daily summary on schedule.
 
 Schedule (IST = UTC+5:30):
-  07:00 IST → Daily Summary + Newsletter  (DAILY_SUMMARY_HOUR from config)
+  07:00 IST → Daily Summary + Newsletter
   08:00 IST → Cycle 1
   15:00 IST → Cycle 2
   21:00 IST → Cycle 3
 
-On first startup, a boot cycle runs 90 seconds after launch so you get
-fresh intelligence immediately without waiting for the next slot.
+All 3 cycles complete well before 23:00 IST (each takes ~25–30 min).
 
-NOTE: This file is launched as a subprocess by app.py.
-      It runs the bot polling loop (if webhook mode is not active)
-      and the scheduling loop in a single process.
+FIX: _SLOT_WINDOW_MINS raised to 6 (was 4 — too tight if scheduler restarts
+     at minute 4 or 5 of the hour, causing the slot to be silently skipped).
+FIX: update_runtime_state now includes last_cycle_started_at and last_cycle_finished_at.
 """
 
 import os
@@ -22,10 +21,6 @@ import time
 import threading
 import traceback
 from datetime import datetime, timezone, timedelta
-
-# ─────────────────────────────────────────────────────────────
-# IST HELPERS
-# ─────────────────────────────────────────────────────────────
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -51,12 +46,11 @@ CYCLE_SLOTS = [
     (21, 0, "21:00 IST"),
 ]
 
-# Daily summary fires at this IST hour (overridable via DAILY_SUMMARY_HOUR env)
 _DAILY_HOUR = int(os.getenv("DAILY_SUMMARY_HOUR", "7"))
 
-# Window in minutes within which a slot is considered "due" (avoids
-# re-runs if scheduler restarts mid-window)
-_SLOT_WINDOW_MINS = 4
+# FIX: raised from 4 to 6 minutes — prevents missed slots on restart
+_SLOT_WINDOW_MINS = 6
+
 
 # ─────────────────────────────────────────────────────────────
 # RUNTIME STATE HELPERS
@@ -92,7 +86,7 @@ def _next_cycle_dt() -> datetime:
 # ─────────────────────────────────────────────────────────────
 
 _cycle_counter = 0
-_cycle_lock    = threading.Lock()   # prevent overlapping cycles
+_cycle_lock    = threading.Lock()
 
 
 def run_cycle(slot_label: str, boot_cycle: bool = False):
@@ -107,15 +101,22 @@ def run_cycle(slot_label: str, boot_cycle: bool = False):
         cycle_num = _cycle_counter
 
     prefix = "[BOOT-CYCLE]" if boot_cycle else f"[CYCLE {cycle_num}]"
+    started_at = fmt_ist()
+
     print(f"\n{'='*60}")
     print(f"{prefix} Starting — {slot_label}")
-    print(f"{prefix} IST: {fmt_ist()}")
+    print(f"{prefix} IST: {started_at}")
     print(f"{'='*60}\n")
 
     _update_state(
         phase="collecting",
         current_cycle_number=cycle_num,
         current_cycle_slot=slot_label,
+        last_cycle_started_at=started_at,
+        current_item_title="",
+        queue_total=0,
+        queue_done=0,
+        queue_failed=0,
     )
 
     processed_items = []
@@ -137,7 +138,7 @@ def run_cycle(slot_label: str, boot_cycle: bool = False):
         from telemetry import update as tele_update
         tele_update("cycle_start")
 
-        # 4. Reset dedupe cache (fresh load from disk)
+        # 4. Reset dedupe cache
         from dedupe import reset_cache
         reset_cache()
 
@@ -218,12 +219,14 @@ def run_cycle(slot_label: str, boot_cycle: bool = False):
         traceback.print_exc()
 
     finally:
-        next_dt = _next_cycle_dt()
+        finished_at = fmt_ist()
+        next_dt     = _next_cycle_dt()
         _update_state(
             phase="idle",
             next_cycle_at_ist=fmt_ist(next_dt),
+            last_cycle_finished_at=finished_at,
         )
-        print(f"\n{prefix} Done — next cycle at {fmt_ist(next_dt)}\n")
+        print(f"\n{prefix} Done at {finished_at} — next cycle at {fmt_ist(next_dt)}\n")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -259,11 +262,10 @@ def _boot_cycle_thread():
     immediately rather than waiting for the next scheduled slot.
     Skipped if a scheduled slot fires within 10 minutes.
     """
-    delay = 90   # seconds
+    delay = 90
     print(f"[SCHED] Boot cycle scheduled in {delay}s")
     time.sleep(delay)
 
-    # Check if a scheduled slot is within ±10 minutes
     now = now_ist()
     for h, m, _ in CYCLE_SLOTS:
         slot = now.replace(hour=h, minute=m, second=0, microsecond=0)
@@ -271,7 +273,6 @@ def _boot_cycle_thread():
             print("[SCHED] Boot cycle skipped — scheduled slot is imminent")
             return
 
-    # Also skip if daily summary is imminent
     daily_slot = now.replace(hour=_DAILY_HOUR, minute=0, second=0, microsecond=0)
     if abs((daily_slot - now).total_seconds()) < 600:
         print("[SCHED] Boot cycle skipped — daily summary is imminent")
@@ -288,7 +289,7 @@ def main():
     print("\n[SCHED] ====== JARVIS Scheduler Starting ======")
     print(f"[SCHED] IST: {fmt_ist()}")
 
-    # ── Start bot listener (polling or webhook mode based on env) ──
+    # Start bot listener (polling or webhook based on env)
     try:
         from bot_listener import start_listener
         start_listener()
@@ -296,19 +297,22 @@ def main():
         print(f"[SCHED] Bot listener failed to start: {e}")
         traceback.print_exc()
 
-    # ── Initial runtime state ──
+    # Initial runtime state
     _update_state(
         phase="idle",
         current_cycle_number=0,
         current_cycle_slot=None,
         next_cycle_at_ist=fmt_ist(_next_cycle_dt()),
+        last_cycle_started_at="",
+        last_cycle_finished_at="",
     )
 
-    # ── Boot cycle (runs once after short delay) ──
+    # Boot cycle (runs once after short delay)
     threading.Thread(target=_boot_cycle_thread, daemon=True).start()
 
     print(f"[SCHED] Cycle slots (IST): {[s[2] for s in CYCLE_SLOTS]}")
     print(f"[SCHED] Daily summary hour: {_DAILY_HOUR:02d}:00 IST")
+    print(f"[SCHED] Slot window: {_SLOT_WINDOW_MINS} minutes")
     print(f"[SCHED] Next cycle: {fmt_ist(_next_cycle_dt())}")
     print("[SCHED] Scheduling loop active\n")
 
@@ -321,34 +325,33 @@ def main():
             date_str = now.strftime("%Y-%m-%d")
             h, m     = now.hour, now.minute
 
-            # ── Daily summary check ──
+            # Daily summary check
             daily_key = f"{date_str}-daily"
             if h == _DAILY_HOUR and 0 <= m < _SLOT_WINDOW_MINS and daily_key not in ran_slots:
                 ran_slots.add(daily_key)
                 threading.Thread(target=run_daily, daemon=False).start()
 
-            # ── Cycle slot checks ──
+            # Cycle slot checks
             for slot_h, slot_m, slot_label in CYCLE_SLOTS:
                 slot_key = f"{date_str}-{slot_h:02d}"
                 if h == slot_h and 0 <= m < _SLOT_WINDOW_MINS and slot_key not in ran_slots:
                     ran_slots.add(slot_key)
-                    # Run cycle in a thread (daemon=False keeps process alive while running)
                     threading.Thread(
                         target=run_cycle,
                         args=(slot_label,),
                         kwargs={"boot_cycle": False},
                         daemon=False,
                     ).start()
-                    break   # Only start one cycle per check
+                    break
 
-            # ── Prune old keys (keep today's + yesterday's keys) ──
+            # Prune old keys — keep today and yesterday
             yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
             ran_slots = {k for k in ran_slots if k.startswith(date_str) or k.startswith(yesterday)}
 
         except Exception as e:
             print(f"[SCHED] Loop error: {e}")
 
-        time.sleep(30)   # Check every 30 seconds
+        time.sleep(30)
 
 
 if __name__ == "__main__":

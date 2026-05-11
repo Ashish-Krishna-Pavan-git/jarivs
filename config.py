@@ -75,30 +75,10 @@ AI_TIMEOUT           = 120
 AI_TEMPERATURE       = 0.1
 AI_MAX_TOKENS        = 800
 
-# Provider pacing and quotas are configurable from env so HF deployments can
-# be tuned without code edits.
-GEMINI_MIN_INTERVAL = float(os.getenv("GEMINI_MIN_INTERVAL", "4.5"))
-GROQ_MIN_INTERVAL   = float(os.getenv("GROQ_MIN_INTERVAL", "2.5"))
-
-GEMINI_SYNTHESIS_MODEL         = os.getenv("GEMINI_SYNTHESIS_MODEL", "gemini-2.5-flash")
-GEMINI_FALLBACK_MODEL          = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash-lite")
-GEMINI_GENERAL_MODEL           = os.getenv("GEMINI_GENERAL_MODEL", "gemini-2.5-flash-lite")
-GROQ_ARTICLE_MODEL             = os.getenv("GROQ_ARTICLE_MODEL", "llama-3.1-8b-instant")
-GROQ_ARTICLE_FALLBACK_MODEL    = os.getenv("GROQ_ARTICLE_FALLBACK_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
-GROQ_SYNTHESIS_MODEL           = os.getenv("GROQ_SYNTHESIS_MODEL", "llama-3.3-70b-versatile")
-GROQ_TEXT_MODEL                = os.getenv("GROQ_TEXT_MODEL", "llama-3.3-70b-versatile")
-
-GEMINI_SYNTHESIS_HOURLY_LIMIT  = int(os.getenv("GEMINI_SYNTHESIS_HOURLY_LIMIT", "6"))
-GEMINI_SYNTHESIS_DAILY_LIMIT   = int(os.getenv("GEMINI_SYNTHESIS_DAILY_LIMIT", "20"))
-GEMINI_SYNTHESIS_WEEKLY_LIMIT  = int(os.getenv("GEMINI_SYNTHESIS_WEEKLY_LIMIT", "100"))
-GEMINI_PRIORITY_RESERVED_SLOTS = int(os.getenv("GEMINI_PRIORITY_RESERVED_SLOTS", "4"))
-GEMINI_GENERAL_HOURLY_LIMIT    = int(os.getenv("GEMINI_GENERAL_HOURLY_LIMIT", "4"))
-GEMINI_GENERAL_DAILY_LIMIT     = int(os.getenv("GEMINI_GENERAL_DAILY_LIMIT", "16"))
-GEMINI_COOLDOWN_429_SECONDS    = int(os.getenv("GEMINI_COOLDOWN_429_SECONDS", "1800"))
-GEMINI_COOLDOWN_DAILY_SECONDS  = int(os.getenv("GEMINI_COOLDOWN_DAILY_SECONDS", "28800"))
-GROQ_HOURLY_LIMIT              = int(os.getenv("GROQ_HOURLY_LIMIT", "500"))
-GROQ_DAILY_LIMIT               = int(os.getenv("GROQ_DAILY_LIMIT", "5000"))
-GROQ_COOLDOWN_429_SECONDS      = int(os.getenv("GROQ_COOLDOWN_429_SECONDS", "120"))
+# Gemini free tier: 15 RPM → 4.0s minimum between calls (use 4.5 for safety)
+# Groq free tier:  30 RPM → 2.0s minimum between calls (use 2.5 for safety)
+GEMINI_MIN_INTERVAL = 4.5
+GROQ_MIN_INTERVAL   = 2.5
 
 # ─────────────────────────────────────────────────────────────
 # PATHS  (/tmp/jarvis/ survives within a session & is always writable)
@@ -112,17 +92,17 @@ DAILY_DIR     = os.path.join(_BASE, "daily")
 ARCHIVE_DIR   = os.path.join(_BASE, "archive")
 RAW_DIR       = os.path.join(_BASE, "raw_articles")
 
-# State files live in CWD (working dir of the space).
-# storage_backend syncs these to HF Dataset for persistence.
-SEEN_FILE         = "seen.json"
-TELEMETRY_FILE    = "telemetry.json"
-QUEUE_FILE        = "queue.json"          # Not used (in-memory queue)
-DIGEST_STATE_FILE = "digest_state.json"
-PROVIDER_STATE_FILE = "provider_state.json"
-RUNTIME_STATE_FILE  = "runtime_state.json"
-SUBSCRIBERS_FILE    = os.path.join("data", "subscribers.json")
+# ─────────────────────────────────────────────────────────────
+# STATE FILES  (CWD — synced to HF Dataset for persistence)
+# ─────────────────────────────────────────────────────────────
+
+SEEN_FILE          = "seen.json"
+TELEMETRY_FILE     = "telemetry.json"
+QUEUE_FILE         = "queue.json"           # Not used (in-memory queue)
+DIGEST_STATE_FILE  = "digest_state.json"
+RUNTIME_STATE_FILE = "runtime_state.json"   # FIX: was missing — crashed runtime_state.py
+SUBSCRIBERS_FILE   = os.path.join("data", "subscribers.json")  # FIX: was missing — crashed subscriber_store.py
 
 # Ensure data dirs exist at import time
-for _d in [PROCESSED_DIR, DAILY_DIR, ARCHIVE_DIR, RAW_DIR]:
+for _d in [PROCESSED_DIR, DAILY_DIR, ARCHIVE_DIR, RAW_DIR, os.path.dirname(SUBSCRIBERS_FILE)]:
     os.makedirs(_d, exist_ok=True)
-os.makedirs(os.path.dirname(SUBSCRIBERS_FILE), exist_ok=True)

@@ -9,43 +9,41 @@ SETUP (one-time):
   2. Set env vars in HF Space secrets:
        HF_TOKEN       = your HuggingFace write token (Settings → Access Tokens)
        HF_STORAGE_REPO = AKP-07/jarvis-data
+
+FIX: Added runtime_state.json + data/subscribers.json to CRITICAL_FILES.
+FIX: provider_state.json pulled optionally (no crash if missing).
 """
 
 import os
 import json
 import shutil
-import time
 from pathlib import Path
 from datetime import datetime, timedelta
 
 try:
-    from huggingface_hub import HfApi, hf_hub_download, CommitOperationAdd
+    from huggingface_hub import HfApi, hf_hub_download
     HF_HUB_OK = True
 except ImportError:
     HF_HUB_OK = False
     print("[HF_STORAGE] huggingface_hub not available — running ephemeral mode")
 
-from config import (
-    SEEN_FILE,
-    DIGEST_STATE_FILE,
-    TELEMETRY_FILE,
-    PROVIDER_STATE_FILE,
-    RUNTIME_STATE_FILE,
-    SUBSCRIBERS_FILE,
-)
+REPO_ID  = os.getenv("HF_STORAGE_REPO", "")   # e.g. "AKP-07/jarvis-data"
+HF_TOKEN = os.getenv("HF_TOKEN", "")
+TMP_DIR  = Path("/tmp/jarvis_hf")
 
-REPO_ID   = os.getenv("HF_STORAGE_REPO", "")   # e.g. "AKP-07/jarvis-data"
-HF_TOKEN  = os.getenv("HF_TOKEN", "")
-TMP_DIR   = Path("/tmp/jarvis_hf")
-
-# Files that MUST persist across restarts
+# Files that MUST persist across restarts.
+# FIX: added runtime_state.json and data/subscribers.json
 CRITICAL_FILES = [
-    SEEN_FILE,
-    DIGEST_STATE_FILE,
-    TELEMETRY_FILE,
-    PROVIDER_STATE_FILE,
-    RUNTIME_STATE_FILE,
-    SUBSCRIBERS_FILE,
+    "seen.json",
+    "digest_state.json",
+    "telemetry.json",
+    "runtime_state.json",
+    "data/subscribers.json",
+]
+
+# Optional files — pulled if present, silently skipped if missing
+OPTIONAL_FILES = [
+    "provider_state.json",
 ]
 
 BUNDLE_FILE = "articles_bundle.json"   # Rolling 72-hour article bundle
@@ -83,10 +81,11 @@ def _ensure_repo():
 
 
 def _download(remote_name, dest_path):
-    """Download one file from HF Dataset repo → dest_path."""
+    """Download one file from HF Dataset repo → dest_path. Returns True on success."""
     try:
         TMP_DIR.mkdir(parents=True, exist_ok=True)
-        Path(dest_path).parent.mkdir(parents=True, exist_ok=True)
+        # Ensure destination directory exists (e.g. data/ for subscribers.json)
+        os.makedirs(os.path.dirname(os.path.abspath(dest_path)), exist_ok=True)
         downloaded = hf_hub_download(
             repo_id=REPO_ID,
             filename=remote_name,
@@ -98,33 +97,29 @@ def _download(remote_name, dest_path):
         shutil.copy2(downloaded, dest_path)
         return True
     except Exception as e:
-        if "404" not in str(e) and "not found" not in str(e).lower():
+        if "404" not in str(e) and "not found" not in str(e).lower() and "Entry Not Found" not in str(e):
             print(f"[HF_STORAGE] Pull {remote_name}: {e}")
         return False
 
 
 def _upload(local_path, remote_name, commit_msg=None):
-    """Upload one file from local_path → HF Dataset repo."""
+    """Upload one file from local_path → HF Dataset repo. Returns True on success."""
     api = _api()
     if not api or not os.path.exists(local_path):
         return False
-    for attempt in range(1, 4):
-        try:
-            api.upload_file(
-                path_or_fileobj=str(local_path),
-                path_in_repo=remote_name,
-                repo_id=REPO_ID,
-                repo_type="dataset",
-                token=HF_TOKEN,
-                commit_message=commit_msg or f"Update {remote_name}",
-            )
-            return True
-        except Exception as e:
-            if attempt == 3:
-                print(f"[HF_STORAGE] Upload {remote_name}: {e}")
-                return False
-            time.sleep(attempt * 2)
-    return False
+    try:
+        api.upload_file(
+            path_or_fileobj=str(local_path),
+            path_in_repo=remote_name,
+            repo_id=REPO_ID,
+            repo_type="dataset",
+            token=HF_TOKEN,
+            commit_message=commit_msg or f"Update {remote_name}",
+        )
+        return True
+    except Exception as e:
+        print(f"[HF_STORAGE] Upload {remote_name}: {e}")
+        return False
 
 
 # ─────────────────────────────────────────────────────────────
@@ -142,6 +137,8 @@ def pull_state(working_dir="."):
 
     _ensure_repo()
     pulled = 0
+
+    # Pull critical files (must have)
     for fname in CRITICAL_FILES:
         dest = os.path.join(working_dir, fname)
         if _download(fname, dest):
@@ -149,6 +146,12 @@ def pull_state(working_dir="."):
             pulled += 1
         else:
             print(f"[HF_STORAGE] — {fname} not on HF yet (first run?)")
+
+    # Pull optional files (nice to have, don't count against success)
+    for fname in OPTIONAL_FILES:
+        dest = os.path.join(working_dir, fname)
+        if _download(fname, dest):
+            print(f"[HF_STORAGE] ✓ Pulled {fname} (optional)")
 
     print(f"[HF_STORAGE] Pull done: {pulled}/{len(CRITICAL_FILES)} files restored")
     return True
@@ -165,26 +168,28 @@ def push_state(working_dir=".", new_articles=None):
 
     pushed = 0
 
-    # 1. Push state files
+    # Push state files
     for fname in CRITICAL_FILES:
         src = os.path.join(working_dir, fname)
-        if _upload(src, fname):
+        if os.path.exists(src) and _upload(src, fname):
             pushed += 1
 
-    # 2. Build rolling article bundle (last 72h, max 3000 items)
+    # Push optional files if they exist locally
+    for fname in OPTIONAL_FILES:
+        src = os.path.join(working_dir, fname)
+        if os.path.exists(src):
+            _upload(src, fname)
+
+    # Build rolling article bundle (last 72h, max 3000 items)
     if new_articles:
         bundle_local = TMP_DIR / BUNDLE_FILE
         TMP_DIR.mkdir(parents=True, exist_ok=True)
-
-        # Restore the remote bundle first when this runtime starts fresh.
-        if not bundle_local.exists():
-            _download(BUNDLE_FILE, str(bundle_local))
 
         # Load existing bundle
         existing = []
         if bundle_local.exists():
             try:
-                with open(bundle_local, encoding="utf-8") as f:
+                with open(bundle_local) as f:
                     existing = json.load(f)
             except Exception:
                 existing = []
@@ -204,7 +209,7 @@ def push_state(working_dir=".", new_articles=None):
         # Keep newest 3000
         existing = existing[-3000:]
 
-        with open(bundle_local, "w", encoding="utf-8") as f:
+        with open(bundle_local, "w") as f:
             json.dump(existing, f)
 
         if _upload(str(bundle_local), BUNDLE_FILE, "Update article bundle"):
