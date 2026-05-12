@@ -3,24 +3,21 @@ dailySummary.py
 Morning report: AI correlation across daily digests, audio podcast, WordPress publish,
 and Sunday Weekly "Doom vs Bloom" edition.
 
-FIXED: FORCE_TEST_WEEKLY is now False (was hardcoded True — ran weekly EVERY day)
+CRITICAL FIX: Digest files live in /tmp/ which resets on Space restart.
+When the 7AM daily summary runs, digests from earlier cycles are often gone.
+Fix: if no digests found, fall back to generating AI summary DIRECTLY from articles.
+This ensures the daily report, newsletter, and audio always have content.
 """
 
 import json
 from datetime import datetime
 
 from storage   import load_last_n_hours, load_today_digests, save_daily_report
-from ai_router import ai_daily_summary, ai_weekly_summary
+from ai_router import ai_daily_summary, ai_weekly_summary, ai_digest as ai_make_digest
 from notifier  import send_daily_summary, send_weekly_summary
 from intelligence import trend_analysis, severity_breakdown, top_by_severity, source_breakdown
 
-
-# ─────────────────────────────────────────────────────────────
-# TESTING TOGGLE
-# ─────────────────────────────────────────────────────────────
-# Set FORCE_TEST_WEEKLY = True in scheduler.py's TEST_MODE_WEEKLY flag.
-# This variable is set externally by scheduler.py — do NOT hardcode True here.
-FORCE_TEST_WEEKLY = False   # ← FIXED: was True, which ran weekly summary every single day
+FORCE_TEST_WEEKLY = False   # Only set True manually for testing
 
 
 def run_daily_summary():
@@ -38,13 +35,42 @@ def run_daily_summary():
     digests = load_today_digests()
     print(f"[DAILY] Found {len(digests)} cycle digest(s)")
 
-    # ── AI correlation across all cycle digests ──
+    # ── AI correlation ──
+    # CRITICAL FIX: /tmp/ resets on Space restart, so digests are often missing.
+    # Fallback: generate a fresh digest from the raw articles, then run daily summary on it.
     ai_summary = None
+
     if digests:
-        print("[DAILY] Running AI cross-cycle correlation...")
+        print("[DAILY] Running AI cross-cycle correlation from saved digests...")
         ai_summary = ai_daily_summary(digests)
-    else:
-        print("[DAILY] No digests found — AI daily skipped (will still send stats)")
+
+    if not ai_summary:
+        # Digests missing (Space restarted) OR ai_daily_summary failed — generate from articles
+        print("[DAILY] No usable digests — generating AI summary directly from articles (fallback)...")
+        try:
+            fallback_digest = ai_make_digest(all_items, "full-day-fallback")
+            if fallback_digest:
+                # Wrap in a list so ai_daily_summary can correlate it
+                ai_summary = ai_daily_summary([fallback_digest])
+            # If ai_daily_summary still fails, use the single digest itself as the summary
+            if not ai_summary and fallback_digest:
+                print("[DAILY] Using single-digest as daily summary (degraded mode)")
+                ai_summary = {
+                    "day_headline":       fallback_digest.get("headline", "Daily Intelligence Report"),
+                    "escalating_threats": fallback_digest.get("cybersec_updates", []),
+                    "new_patterns":       [],
+                    "actor_activity":     [],
+                    "critical_cves":      fallback_digest.get("key_cves", []),
+                    "tech_trends":        fallback_digest.get("ai_updates", []) + fallback_digest.get("tech_business_updates", []),
+                    "recommendations":    [],
+                    "risk_level":         "HIGH",
+                    "day_summary":        fallback_digest.get("strategic_note", ""),
+                }
+        except Exception as e:
+            print(f"[DAILY] Fallback AI generation failed: {e}")
+
+    if not ai_summary:
+        print("[DAILY] AI summary completely unavailable — sending stats-only report")
 
     # ── Build stats ──
     breakdown = severity_breakdown(all_items)
@@ -61,7 +87,7 @@ def run_daily_summary():
         if ai_summary.get("day_headline"):
             lines.append(f"\n🎯 {ai_summary['day_headline']}\n")
 
-        risk = ai_summary.get("risk_level", "?")
+        risk      = ai_summary.get("risk_level", "?")
         emoji_map = {"CRITICAL": "🚨", "HIGH": "⚠️", "MEDIUM": "📌", "LOW": "📄"}
         lines.append(f"⚡ RISK LEVEL: {emoji_map.get(risk, '')} {risk}")
 
@@ -98,6 +124,8 @@ def run_daily_summary():
             lines.append("\n✅ RECOMMENDATIONS:")
             for r in ai_summary["recommendations"]:
                 lines.append(f"  ▶ {r}")
+    else:
+        lines.append("\n⚠️ AI analysis unavailable for this report.")
 
     lines.append("\n" + "━" * 45)
     lines.append("\n📊 DAY STATISTICS:")
@@ -107,6 +135,12 @@ def run_daily_summary():
                  "LOW": "📄", "MINIMAL": "ℹ️"}.get(sev, "")
         if count > 0:
             lines.append(f"  {emoji} {sev}: {count}")
+
+    # Top sources
+    sources = source_breakdown(all_items)
+    top_sources = list(sources.items())[:5]
+    if top_sources:
+        lines.append(f"\n📡 TOP SOURCES: " + " | ".join(f"{s}:{c}" for s, c in top_sources))
 
     report_text = "\n".join(lines)
 
@@ -135,7 +169,7 @@ def run_daily_summary():
             send_audio(audio_path)
             print("[DAILY] Audio podcast sent")
         else:
-            print("[DAILY] Audio generation skipped (edge-tts not available?)")
+            print("[DAILY] Audio generation skipped")
     except Exception as e:
         print(f"[DAILY] Audio error: {e}")
 
@@ -160,10 +194,12 @@ def run_daily_summary():
             print(f"[WEEKLY] {len(weekly_items)} articles from past 7 days")
             print("[WEEKLY] Running AI weekly correlation...")
             weekly_ai = ai_weekly_summary(weekly_items)
+            if not weekly_ai:
+                print("[WEEKLY] AI weekly failed — sending stats-only weekly")
             send_weekly_summary(weekly_items, weekly_ai)
             print("[WEEKLY] Sunday digest sent!")
         else:
-            print("[WEEKLY] Not enough data yet for weekly summary.")
+            print(f"[WEEKLY] Not enough data yet ({len(weekly_items)} items). Need 10+.")
     else:
         print(f"[DAILY] Weekly summary skipped (today is not Sunday, weekday={current_day})")
 
