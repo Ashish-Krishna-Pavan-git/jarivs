@@ -2,18 +2,12 @@
 app.py
 Flask web server + JARVIS orchestrator launcher.
 
-WEBHOOK MODE:
-  Telegram pushes updates to /telegram/<token> — much more reliable than polling
-  from HF Spaces, which has intermittent outbound connectivity issues.
-  
-  Set HF_SPACE_URL in Space secrets:
-    HF_SPACE_URL = https://akp-07-jarvis-agent.hf.space
+CRITICAL FIX: delete_webhook() is now called when webhook registration fails.
+Previously, a webhook registered in a prior run stayed active. When the new
+instance started polling, Telegram returned 409 Conflict on every getUpdates
+call — flooding logs and blocking all bot replies.
 
-BUG FIX:
-  If webhook registration fails (e.g. timeout at startup), HF_SPACE_URL is
-  cleared from the environment before launching the scheduler subprocess.
-  This ensures bot_listener.start_listener() falls back to polling mode,
-  so /start and /status commands are never silently ignored.
+Fix: always delete the stale webhook before falling back to polling mode.
 """
 
 import subprocess
@@ -54,13 +48,8 @@ def health():
 
 @app.route(f"/telegram/<token>", methods=["POST"])
 def telegram_webhook(token):
-    """
-    Telegram pushes every update here as a POST request.
-    Much more reliable than long-polling from HF Spaces.
-    """
     if token != TELEGRAM_TOKEN:
         return "Unauthorized", 403
-
     try:
         update = request.get_json(force=True)
         if update:
@@ -70,26 +59,19 @@ def telegram_webhook(token):
             ).start()
     except Exception as e:
         print(f"[WEBHOOK] Error processing update: {e}")
-
     return "ok", 200
 
 
 # ─────────────────────────────────────────────────────────────
-# WEBHOOK REGISTRATION
+# WEBHOOK MANAGEMENT
 # ─────────────────────────────────────────────────────────────
 
 def register_webhook() -> bool:
-    """
-    Register our public HF Space URL as the Telegram webhook.
-    Tries twice with escalating timeouts before giving up.
-    """
     if not TELEGRAM_TOKEN:
         print("[WEBHOOK] No TELEGRAM_TOKEN — skipping webhook registration")
         return False
-
     if not HF_SPACE_URL:
         print("[WEBHOOK] No HF_SPACE_URL set — falling back to polling mode")
-        print("          Add HF_SPACE_URL=https://akp-07-jarvis-agent.hf.space to Space secrets")
         return False
 
     webhook_url = f"{HF_SPACE_URL}/telegram/{TELEGRAM_TOKEN}"
@@ -100,8 +82,8 @@ def register_webhook() -> bool:
             r = requests.post(
                 api_url,
                 json={
-                    "url":             webhook_url,
-                    "allowed_updates": ["message", "channel_post", "edited_message", "edited_channel_post"],
+                    "url":                  webhook_url,
+                    "allowed_updates":      ["message", "channel_post", "edited_message", "edited_channel_post"],
                     "drop_pending_updates": False,
                 },
                 timeout=timeout,
@@ -128,28 +110,34 @@ def register_webhook() -> bool:
 
 
 def delete_webhook():
-    """Remove webhook so polling mode works (call if switching back)."""
+    """
+    Remove any registered webhook.
+    CRITICAL: must be called before starting polling to prevent 409 Conflict.
+    """
     if not TELEGRAM_TOKEN:
         return
     try:
-        requests.post(
+        r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook",
-            timeout=10,
+            json={"drop_pending_updates": False},
+            timeout=15,
         )
-    except Exception:
-        pass
+        if r.status_code == 200 and r.json().get("ok"):
+            print("[WEBHOOK] ✓ Stale webhook deleted — polling mode is clear")
+        else:
+            print(f"[WEBHOOK] deleteWebhook response: {r.text[:80]}")
+    except Exception as e:
+        print(f"[WEBHOOK] deleteWebhook error (non-fatal): {e}")
 
 
 def send_startup_message():
-    """Send a boot notification to verify Telegram connectivity on startup."""
     if not TELEGRAM_TOKEN:
         return
-
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
     if not chat_id:
         return
 
-    time.sleep(5)   # give Flask time to start
+    time.sleep(8)
 
     for attempt in range(1, 4):
         try:
@@ -157,13 +145,13 @@ def send_startup_message():
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
                 json={
                     "chat_id":    chat_id,
-                    "text":       "🤖 *JARVIS Online* — Intelligence system started. First cycle beginning...",
+                    "text":       "🤖 *JARVIS Online* — Intelligence system restarted. Boot cycle starting in 90s.",
                     "parse_mode": "Markdown",
                 },
                 timeout=20,
             )
             if r.status_code == 200:
-                print("[STARTUP] ✓ Telegram connectivity verified — boot message sent")
+                print("[STARTUP] ✓ Boot message sent to Telegram")
                 return
             else:
                 print(f"[STARTUP] Attempt {attempt}: HTTP {r.status_code}")
@@ -171,7 +159,7 @@ def send_startup_message():
             print(f"[STARTUP] Attempt {attempt} error: {e}")
         time.sleep(attempt * 5)
 
-    print("[STARTUP] ✗ All boot message attempts failed — check TELEGRAM_TOKEN/network")
+    print("[STARTUP] ✗ Boot message failed — check TELEGRAM_TOKEN/network")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -185,37 +173,32 @@ if __name__ == "__main__":
         print("[CLOUD] Restoring persisted HF state before webhook startup...")
         pull_state()
 
-    # 1. Try to register Telegram webhook (best mode for HF Spaces)
+    # 1. Try to register Telegram webhook
     webhook_ok = register_webhook()
 
-    # ── KEY FIX ───────────────────────────────────────────────────────────────
-    # When webhook registration fails, HF_SPACE_URL is still set in os.environ.
-    # The scheduler subprocess inherits this env, so bot_listener.start_listener()
-    # assumes webhook mode and NEVER starts the polling loop.
-    # Result: bot is completely deaf — /start and /status get no response.
-    #
-    # Fix: clear HF_SPACE_URL from env before Popen so the child process
-    # inherits an empty value and correctly starts the polling fallback.
-    # ─────────────────────────────────────────────────────────────────────────
-    if not webhook_ok and HF_SPACE_URL:
-        print("[CLOUD] Webhook failed — clearing HF_SPACE_URL so scheduler uses polling mode")
+    if not webhook_ok:
+        # CRITICAL FIX: delete any stale webhook from previous runs BEFORE polling.
+        # Without this, Telegram keeps the old webhook active while we poll → 409 Conflict
+        # on every getUpdates call, flooding logs and silencing all bot replies.
+        print("[CLOUD] Webhook failed — deleting stale webhook and switching to polling mode")
+        delete_webhook()
         os.environ["HF_SPACE_URL"] = ""
 
-    # 2. Start scheduler subprocess (inherits current env, with cleared HF_SPACE_URL if needed)
+    # 2. Start scheduler subprocess (inherits env with cleared HF_SPACE_URL)
     scheduler_proc = subprocess.Popen(
         [sys.executable, "scheduler.py"],
         env=os.environ.copy(),
     )
     print(f"[CLOUD] Scheduler started (pid={scheduler_proc.pid})")
 
-    # 3. Test Telegram connectivity on boot (non-blocking)
+    # 3. Send boot notification (non-blocking)
     threading.Thread(target=send_startup_message, daemon=True).start()
 
     if not webhook_ok:
-        print("[CLOUD] Mode: polling (scheduler handles bot commands via getUpdates loop)")
+        print("[CLOUD] Mode: polling (stale webhook cleared ✓)")
     else:
         print(f"[CLOUD] Mode: webhook → {HF_SPACE_URL}/telegram/<token>")
 
-    # 4. Start Flask (receives webhook POSTs + health checks)
+    # 4. Start Flask
     print("[CLOUD] Starting web server on port 7860...")
     app.run(host="0.0.0.0", port=7860)
