@@ -1,39 +1,48 @@
 """
 audio_generator.py
-Generates a daily audio briefing using edge-tts Python API.
-
-FIX: replaces os.system() shell call which silently fails on HF Spaces.
-Uses async Python API directly — reliable across all platforms.
-Voice: en-US-AriaNeural (natural female news anchor tone).
-Fallback: en-US-JennyNeural → en-US-ChristopherNeural (male).
+Generates a full daily intelligence podcast using edge-tts Python API.
+Voice: en-US-GuyNeural (smooth, natural male — primary)
+       en-US-ChristopherNeural (authoritative news anchor — fallback)
 """
 
-import os
-import re
-import asyncio
+import os, re, asyncio
 
 
 def _clean(text: str) -> str:
-    """Strip emojis, markdown, and problematic punctuation for clean TTS output."""
     text = text.replace("*","").replace("#","").replace("_","").replace("`","")
-    text = text.replace("•","").replace("━","").replace("─","")
-    text = re.sub(r"https?://\S+", "", text)           # remove URLs
-    text = re.sub(r"\[.*?\]", "", text)                # remove brackets
-    text = text.encode("ascii","ignore").decode("ascii")  # strip non-ASCII (emojis)
+    text = text.replace("•","").replace("━","").replace("─","").replace("▶","")
+    text = re.sub(r"https?://\S+", "", text)
+    text = re.sub(r"\[.*?\]", "", text)
+    text = text.encode("ascii","ignore").decode("ascii")
     text = re.sub(r"\s{2,}", " ", text)
     return text.strip()
 
 
-async def _tts_generate(script: str, voice: str, filepath: str) -> bool:
-    """Run edge-tts async generation. Returns True on success."""
+async def _tts(script: str, voice: str, filepath: str) -> bool:
     try:
         import edge_tts
-        communicate = edge_tts.Communicate(script, voice)
-        await communicate.save(filepath)
+        comm = edge_tts.Communicate(script, voice)
+        await comm.save(filepath)
         return os.path.exists(filepath) and os.path.getsize(filepath) > 1024
     except Exception as e:
-        print(f"[AUDIO] TTS error with voice {voice}: {e}")
+        print(f"[AUDIO] TTS error ({voice}): {e}")
         return False
+
+
+def _run_tts(script, voice, filepath):
+    """Run async TTS, handles both fresh and existing event loops."""
+    try:
+        return asyncio.run(_tts(script, voice, filepath))
+    except RuntimeError:
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            result = loop.run_until_complete(_tts(script, voice, filepath))
+            loop.close()
+            return result
+        except Exception as e:
+            print(f"[AUDIO] Event loop error: {e}")
+            return False
 
 
 def generate_daily_audio(ai_summary: dict) -> str | None:
@@ -42,104 +51,116 @@ def generate_daily_audio(ai_summary: dict) -> str | None:
 
     print("[AUDIO] Generating daily intelligence podcast...")
 
-    # ── Build natural-sounding script ──────────────────────────────────────────
-    headline  = ai_summary.get("day_headline", "")
-    summary   = ai_summary.get("day_summary", "")
-    risk      = ai_summary.get("risk_level", "MEDIUM")
-    threats   = ai_summary.get("escalating_threats", [])
-    patterns  = ai_summary.get("new_patterns", [])
-    actors    = ai_summary.get("actor_activity", [])
-    trends    = ai_summary.get("tech_trends", [])
-    recs      = ai_summary.get("recommendations", [])
-    cves      = ai_summary.get("critical_cves", [])
+    risk     = ai_summary.get("risk_level", "MEDIUM")
+    headline = ai_summary.get("day_headline", "")
+    summary  = ai_summary.get("day_summary", "")
+    threats  = ai_summary.get("escalating_threats", [])
+    patterns = ai_summary.get("new_patterns", [])
+    actors   = ai_summary.get("actor_activity", [])
+    trends   = ai_summary.get("tech_trends", [])
+    recs     = ai_summary.get("recommendations", [])
+    cves     = ai_summary.get("critical_cves", [])
 
-    script_parts = []
-    script_parts.append(
-        "Good morning. This is JARVIS — your daily intelligence briefing. "
-        f"Today's overall risk level is {risk}. "
+    from datetime import datetime
+    today = datetime.utcnow().strftime("%B %d, %Y")
+
+    parts = []
+
+    # ── Opening ───────────────────────────────────────────────
+    parts.append(
+        f"Good morning. Welcome to the JARVIS Daily Intelligence Briefing for {today}. "
+        f"I am your AI analyst, and today's overall threat level is rated {risk}. "
+        f"Let's get into what matters."
     )
 
+    # ── Headline ──────────────────────────────────────────────
     if headline:
-        script_parts.append(f"Today's headline: {headline}. ")
+        parts.append(f"Today's headline: {headline}.")
 
+    # ── Executive Summary ─────────────────────────────────────
     if summary:
-        script_parts.append(f"{summary} ")
+        parts.append(f"Here is the executive summary. {summary}")
 
+    # ── Escalating Threats ────────────────────────────────────
     if threats:
-        script_parts.append("Here are the escalating threats requiring your attention. ")
-        for t in threats[:3]:
-            script_parts.append(f"{t}. ")
+        parts.append(
+            f"Now, the threats that are escalating and demand your immediate attention. "
+            f"We identified {len(threats)} developing situations."
+        )
+        for i, t in enumerate(threats[:4], 1):
+            parts.append(f"Threat number {i}: {t}.")
 
+    # ── Patterns ──────────────────────────────────────────────
     if patterns:
-        script_parts.append("Our cross-cycle analysis has identified the following patterns. ")
-        for p in patterns[:2]:
-            script_parts.append(f"{p}. ")
+        parts.append(
+            "Our cross-cycle analysis has surfaced some important patterns "
+            "that are not visible when looking at individual incidents."
+        )
+        for p in patterns[:3]:
+            parts.append(f"{p}.")
 
+    # ── Threat Actors ─────────────────────────────────────────
     if actors:
-        script_parts.append("Regarding threat actor activity. ")
-        for a in actors[:2]:
-            script_parts.append(f"{a}. ")
+        parts.append("On the threat actor front:")
+        for a in actors[:3]:
+            parts.append(f"{a}.")
 
+    # ── CVEs ──────────────────────────────────────────────────
     if cves:
-        script_parts.append(f"Critical vulnerabilities to prioritise: {', '.join(cves[:3])}. ")
+        cve_list = ", ".join(cves[:5])
+        parts.append(
+            f"The critical vulnerabilities you need to patch today are: {cve_list}. "
+            f"Do not leave these open. Attackers are actively scanning for them."
+        )
 
+    # ── Tech Trends ───────────────────────────────────────────
     if trends:
-        script_parts.append("On the technology front. ")
-        for t in trends[:2]:
-            script_parts.append(f"{t}. ")
+        parts.append("Shifting to technology and AI developments worth tracking:")
+        for t in trends[:3]:
+            parts.append(f"{t}.")
 
+    # ── Recommendations ───────────────────────────────────────
     if recs:
-        script_parts.append("Finally, today's recommended actions. ")
-        for i, r in enumerate(recs[:3], 1):
-            script_parts.append(f"Action {i}: {r}. ")
+        parts.append(
+            f"Finally, here are your {len(recs[:4])} recommended actions for today. "
+            "These are prioritised by urgency."
+        )
+        for i, r in enumerate(recs[:4], 1):
+            parts.append(f"Action {i}: {r}.")
 
-    script_parts.append(
-        "That concludes today's JARVIS intelligence briefing. "
-        "Stay vigilant, stay informed, and stay secure."
+    # ── Closing ───────────────────────────────────────────────
+    parts.append(
+        "That is your JARVIS Daily Intelligence Briefing. "
+        "Stay ahead of the threats. Stay secure. "
+        "The next briefing will be delivered at your scheduled cycle time. "
+        "JARVIS out."
     )
 
-    raw_script  = " ".join(script_parts)
+    raw_script   = "  ".join(parts)
     clean_script = _clean(raw_script)
 
-    if len(clean_script) < 50:
-        print("[AUDIO] Script too short after cleaning — skipping audio")
+    if len(clean_script) < 100:
+        print("[AUDIO] Script too short — skipping")
         return None
 
-    print(f"[AUDIO] Script: {len(clean_script)} characters")
+    print(f"[AUDIO] Script length: {len(clean_script)} chars (~{len(clean_script)//15} seconds)")
 
     os.makedirs("data/audio", exist_ok=True)
     filepath = "data/audio/daily_podcast.mp3"
 
-    # ── Try voices in order ────────────────────────────────────────────────────
+    # Male voices — smooth and professional
     voices = [
-        "en-US-AriaNeural",        # Natural female, news anchor style
-        "en-US-JennyNeural",       # Clear female, professional
-        "en-US-ChristopherNeural", # Male fallback
+        "en-US-GuyNeural",          # Natural, conversational male (PRIMARY)
+        "en-US-ChristopherNeural",  # Authoritative news anchor (FALLBACK)
+        "en-US-EricNeural",         # Warm, engaging (LAST RESORT)
     ]
 
     for voice in voices:
         print(f"[AUDIO] Trying voice: {voice}")
-        try:
-            success = asyncio.run(_tts_generate(clean_script, voice, filepath))
-            if success:
-                size_kb = os.path.getsize(filepath) // 1024
-                print(f"[AUDIO] ✓ Generated with {voice} — {size_kb}KB saved to {filepath}")
-                return filepath
-        except RuntimeError:
-            # asyncio.run() fails if there's already a running event loop (some environments)
-            try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                success = loop.run_until_complete(_tts_generate(clean_script, voice, filepath))
-                loop.close()
-                if success:
-                    size_kb = os.path.getsize(filepath) // 1024
-                    print(f"[AUDIO] ✓ Generated with {voice} (new loop) — {size_kb}KB")
-                    return filepath
-            except Exception as e:
-                print(f"[AUDIO] Loop error with {voice}: {e}")
-        except Exception as e:
-            print(f"[AUDIO] Failed with {voice}: {e}")
+        if _run_tts(clean_script, voice, filepath):
+            kb = os.path.getsize(filepath) // 1024
+            print(f"[AUDIO] ✓ {voice} — {kb}KB → {filepath}")
+            return filepath
 
-    print("[AUDIO] ✗ All TTS voices failed — check edge-tts installation")
+    print("[AUDIO] ✗ All voices failed — check edge-tts installation: pip install edge-tts")
     return None

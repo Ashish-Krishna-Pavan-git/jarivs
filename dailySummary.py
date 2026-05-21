@@ -1,207 +1,172 @@
 """
-dailySummary.py
-Morning report: AI correlation across daily digests, audio podcast, WordPress publish,
-and Sunday Weekly "Doom vs Bloom" edition.
+dailySummary.py — Morning report pipeline.
+Sends the full daily intelligence report to:
+  1. Telegram (text)
+  2. Audio podcast (full report, not just a snippet)
+  3. WordPress newsletter (full HTML report)
+  4. Sunday: Weekly Doom vs Bloom edition
 
-CRITICAL FIX: Digest files live in /tmp/ which resets on Space restart.
-When the 7AM daily summary runs, digests from earlier cycles are often gone.
-Fix: if no digests found, fall back to generating AI summary DIRECTLY from articles.
-This ensures the daily report, newsletter, and audio always have content.
+CRITICAL FIX: /tmp/ resets on HF restart — digests lost.
+Fix: if no digests found, generate AI summary directly from articles.
+This ensures audio and newsletter always have real content.
 """
 
 import json
 from datetime import datetime
 
-from storage   import load_last_n_hours, load_today_digests, save_daily_report
-from ai_router import ai_daily_summary, ai_weekly_summary, ai_digest as ai_make_digest
-from notifier  import send_daily_summary, send_weekly_summary
-from intelligence import trend_analysis, severity_breakdown, top_by_severity, source_breakdown
+from storage    import load_last_n_hours, load_today_digests, save_daily_report
+from ai_router  import ai_daily_summary, ai_weekly_summary, ai_digest as ai_make_digest
+from notifier   import send_daily_summary, send_weekly_summary
+from intelligence import trend_analysis, severity_breakdown, source_breakdown
 
-FORCE_TEST_WEEKLY = False   # Only set True manually for testing
+FORCE_TEST_WEEKLY = False
 
 
 def run_daily_summary():
-    print("\n[DAILY SUMMARY] Starting morning report...\n")
+    print("\n[DAILY] Starting morning report pipeline...\n")
 
-    # ── Load all items from past 24 hours ──
     all_items = load_last_n_hours(hours=24)
     print(f"[DAILY] {len(all_items)} articles from past 24h")
 
     if not all_items:
-        print("[DAILY] No data to summarize — skipping")
+        print("[DAILY] No data — skipping")
         return
 
-    # ── Load today's cycle digests ──
-    digests = load_today_digests()
-    print(f"[DAILY] Found {len(digests)} cycle digest(s)")
-
-    # ── AI correlation ──
-    # CRITICAL FIX: /tmp/ resets on Space restart, so digests are often missing.
-    # Fallback: generate a fresh digest from the raw articles, then run daily summary on it.
+    # ── Get AI summary ──────────────────────────────────────────────────────
+    digests    = load_today_digests()
     ai_summary = None
+    print(f"[DAILY] Found {len(digests)} saved digest(s)")
 
     if digests:
-        print("[DAILY] Running AI cross-cycle correlation from saved digests...")
+        print("[DAILY] Running cross-cycle AI correlation...")
         ai_summary = ai_daily_summary(digests)
 
     if not ai_summary:
-        # Digests missing (Space restarted) OR ai_daily_summary failed — generate from articles
-        print("[DAILY] No usable digests — generating AI summary directly from articles (fallback)...")
+        # /tmp/ was cleared on restart — rebuild from articles directly
+        print("[DAILY] No usable digests — generating AI summary from articles (fallback)...")
         try:
-            fallback_digest = ai_make_digest(all_items, "full-day-fallback")
-            if fallback_digest:
-                # Wrap in a list so ai_daily_summary can correlate it
-                ai_summary = ai_daily_summary([fallback_digest])
-            # If ai_daily_summary still fails, use the single digest itself as the summary
-            if not ai_summary and fallback_digest:
-                print("[DAILY] Using single-digest as daily summary (degraded mode)")
+            fallback = ai_make_digest(all_items, "full-day")
+            if fallback:
+                ai_summary = ai_daily_summary([fallback])
+            if not ai_summary and fallback:
+                # Degrade gracefully — use single digest as daily summary
+                print("[DAILY] Using single-digest fallback (degraded mode)")
                 ai_summary = {
-                    "day_headline":       fallback_digest.get("headline", "Daily Intelligence Report"),
-                    "escalating_threats": fallback_digest.get("cybersec_updates", []),
-                    "new_patterns":       [],
-                    "actor_activity":     [],
-                    "critical_cves":      fallback_digest.get("key_cves", []),
-                    "tech_trends":        fallback_digest.get("ai_updates", []) + fallback_digest.get("tech_business_updates", []),
-                    "recommendations":    [],
-                    "risk_level":         "HIGH",
-                    "day_summary":        fallback_digest.get("strategic_note", ""),
+                    "day_headline":      fallback.get("headline","Daily Intelligence Report"),
+                    "escalating_threats":fallback.get("cybersec_updates",[]),
+                    "new_patterns":      [],
+                    "actor_activity":    [],
+                    "critical_cves":     fallback.get("key_cves",[]),
+                    "tech_trends":       fallback.get("ai_updates",[]) + fallback.get("tech_business_updates",[]),
+                    "recommendations":   [],
+                    "risk_level":        "HIGH",
+                    "day_summary":       fallback.get("strategic_note",""),
                 }
         except Exception as e:
-            print(f"[DAILY] Fallback AI generation failed: {e}")
+            print(f"[DAILY] Fallback AI failed: {e}")
 
     if not ai_summary:
-        print("[DAILY] AI summary completely unavailable — sending stats-only report")
+        print("[DAILY] AI completely unavailable — stats-only report")
 
-    # ── Build stats ──
+    # ── Build report ────────────────────────────────────────────────────────
     breakdown = severity_breakdown(all_items)
     trends    = trend_analysis(all_items)
+    sources   = source_breakdown(all_items)
+    now       = datetime.utcnow().strftime("%Y-%m-%d")
 
-    # ── Build report text ──
-    now   = datetime.utcnow().strftime("%Y-%m-%d")
-    lines = []
-
-    lines.append(f"🗓 DAILY INTELLIGENCE REPORT — {now}")
-    lines.append("━" * 45)
-
-    if ai_summary:
-        if ai_summary.get("day_headline"):
-            lines.append(f"\n🎯 {ai_summary['day_headline']}\n")
-
-        risk      = ai_summary.get("risk_level", "?")
-        emoji_map = {"CRITICAL": "🚨", "HIGH": "⚠️", "MEDIUM": "📌", "LOW": "📄"}
-        lines.append(f"⚡ RISK LEVEL: {emoji_map.get(risk, '')} {risk}")
-
-        if ai_summary.get("day_summary"):
-            lines.append(f"\n{ai_summary['day_summary']}")
-
-        lines.append("\n" + "━" * 45)
-        lines.append("📋 KEY TAKEAWAYS:")
-
-        if ai_summary.get("critical_cves"):
-            lines.append(f"\n🔴 KEY CVEs: {', '.join(ai_summary['critical_cves'])}")
-
-        if ai_summary.get("escalating_threats"):
-            lines.append("\n🔺 ESCALATING THREATS:")
-            for t in ai_summary["escalating_threats"]:
-                lines.append(f"  • {t}")
-
-        if ai_summary.get("actor_activity"):
-            lines.append("\n🎭 THREAT ACTORS:")
-            for a in ai_summary["actor_activity"]:
-                lines.append(f"  • {a}")
-
-        if ai_summary.get("new_patterns"):
-            lines.append("\n🔍 PATTERNS OBSERVED:")
-            for p in ai_summary["new_patterns"]:
-                lines.append(f"  • {p}")
-
-        if ai_summary.get("tech_trends"):
-            lines.append("\n💡 TECH TRENDS:")
-            for t in ai_summary["tech_trends"]:
-                lines.append(f"  • {t}")
-
-        if ai_summary.get("recommendations"):
-            lines.append("\n✅ RECOMMENDATIONS:")
-            for r in ai_summary["recommendations"]:
-                lines.append(f"  ▶ {r}")
-    else:
-        lines.append("\n⚠️ AI analysis unavailable for this report.")
-
-    lines.append("\n" + "━" * 45)
-    lines.append("\n📊 DAY STATISTICS:")
-    lines.append(f"  Total articles: {len(all_items)}")
-    for sev, count in breakdown.items():
-        emoji = {"CRITICAL": "🚨", "HIGH": "⚠️", "MEDIUM": "📌",
-                 "LOW": "📄", "MINIMAL": "ℹ️"}.get(sev, "")
-        if count > 0:
-            lines.append(f"  {emoji} {sev}: {count}")
-
-    # Top sources
-    sources = source_breakdown(all_items)
-    top_sources = list(sources.items())[:5]
-    if top_sources:
-        lines.append(f"\n📡 TOP SOURCES: " + " | ".join(f"{s}:{c}" for s, c in top_sources))
-
-    report_text = "\n".join(lines)
-
-    # ── Save report ──
-    report_data = {
-        "date":         now,
-        "total":        len(all_items),
-        "breakdown":    breakdown,
-        "trends":       trends,
-        "ai_summary":   ai_summary,
-        "generated_at": datetime.utcnow().isoformat(),
-    }
-    save_daily_report(report_data, report_text)
-    print("[DAILY] Report saved to disk")
-
-    # ── 1. Send via Telegram ──
+    # ── 1. Send Telegram ────────────────────────────────────────────────────
     send_daily_summary(all_items, ai_summary)
-    print("[DAILY] Report sent to Telegram")
+    print("[DAILY] ✓ Telegram report sent")
 
-    # ── 2. Generate & send audio podcast ──
+    # ── 2. Generate and send audio podcast (full report) ───────────────────
     try:
         from audio_generator import generate_daily_audio
         from notifier import send_audio
         audio_path = generate_daily_audio(ai_summary)
         if audio_path:
             send_audio(audio_path)
-            print("[DAILY] Audio podcast sent")
+            print("[DAILY] ✓ Audio podcast sent")
         else:
-            print("[DAILY] Audio generation skipped")
+            print("[DAILY] Audio generation failed — skipping")
     except Exception as e:
         print(f"[DAILY] Audio error: {e}")
 
-    # ── 3. Publish WordPress newsletter ──
+    # ── 3. Publish full WordPress newsletter ────────────────────────────────
     try:
         from newsletter_publisher import save_and_publish_newsletter
         save_and_publish_newsletter(ai_summary, all_items)
+        print("[DAILY] ✓ Newsletter published")
     except Exception as e:
         print(f"[DAILY] Newsletter error: {e}")
 
-    # ─────────────────────────────────────────────────────────
-    # PHASE 3: SUNDAY "DOOM VS BLOOM" WEEKLY EDITION
-    # ─────────────────────────────────────────────────────────
-    current_day = datetime.now().weekday()   # 0=Monday … 6=Sunday
-    is_sunday   = (current_day == 6)
+    # ── 4. Save report ──────────────────────────────────────────────────────
+    report_data = {
+        "date":         now,
+        "total":        len(all_items),
+        "breakdown":    breakdown,
+        "trends":       trends,
+        "top_sources":  dict(list(sources.items())[:10]),
+        "ai_summary":   ai_summary,
+        "generated_at": datetime.utcnow().isoformat(),
+    }
+    lines = [f"JARVIS DAILY REPORT — {now}"]
+    if ai_summary:
+        lines.append(f"Headline: {ai_summary.get('day_headline','')}")
+        lines.append(f"Risk: {ai_summary.get('risk_level','?')}")
+        lines.append(ai_summary.get('day_summary',''))
+    lines.append(f"Total articles: {len(all_items)}")
+    save_daily_report(report_data, "\n".join(lines))
+    print("[DAILY] ✓ Report saved")
 
-    if is_sunday or FORCE_TEST_WEEKLY:
-        print("\n[WEEKLY] Triggering Sunday 'Doom vs Bloom' edition...")
-        weekly_items = load_last_n_hours(168)   # 7 days
-
+    # ── 5. Sunday Weekly Edition ────────────────────────────────────────────
+    current_day = datetime.now().weekday()   # 0=Mon … 6=Sun
+    if current_day == 6 or FORCE_TEST_WEEKLY:
+        print("\n[WEEKLY] Triggering Sunday Doom vs Bloom edition...")
+        weekly_items = load_last_n_hours(168)
         if len(weekly_items) >= 10:
-            print(f"[WEEKLY] {len(weekly_items)} articles from past 7 days")
-            print("[WEEKLY] Running AI weekly correlation...")
+            print(f"[WEEKLY] {len(weekly_items)} articles from past 7 days — running AI...")
             weekly_ai = ai_weekly_summary(weekly_items)
-            if not weekly_ai:
-                print("[WEEKLY] AI weekly failed — sending stats-only weekly")
             send_weekly_summary(weekly_items, weekly_ai)
-            print("[WEEKLY] Sunday digest sent!")
+
+            # Weekly audio
+            try:
+                if weekly_ai:
+                    from audio_generator import generate_daily_audio
+                    from notifier import send_audio
+                    # Build weekly-flavoured summary for audio
+                    weekly_audio_summary = {
+                        "day_headline":      weekly_ai.get("day_headline",""),
+                        "day_summary":       weekly_ai.get("day_summary",""),
+                        "risk_level":        weekly_ai.get("risk_level","HIGH"),
+                        "escalating_threats":weekly_ai.get("doom",[]),
+                        "tech_trends":       weekly_ai.get("bloom",[]),
+                        "critical_cves":     weekly_ai.get("key_cves",[]),
+                        "recommendations":   [],
+                        "new_patterns":      [],
+                        "actor_activity":    [],
+                    }
+                    audio_path = generate_daily_audio(weekly_audio_summary)
+                    if audio_path:
+                        send_audio(audio_path, caption="🎙️ JARVIS Sunday Weekly Intelligence Podcast")
+                        print("[WEEKLY] ✓ Weekly audio sent")
+            except Exception as e:
+                print(f"[WEEKLY] Audio error: {e}")
+
+            # Weekly newsletter
+            try:
+                from newsletter_publisher import save_and_publish_newsletter
+                save_and_publish_newsletter(weekly_ai, weekly_items)
+                print("[WEEKLY] ✓ Newsletter published")
+            except Exception as e:
+                print(f"[WEEKLY] Newsletter error: {e}")
+
+            print("[WEEKLY] ✓ Sunday digest complete")
         else:
-            print(f"[WEEKLY] Not enough data yet ({len(weekly_items)} items). Need 10+.")
+            print(f"[WEEKLY] Not enough data ({len(weekly_items)} items, need 10+)")
     else:
-        print(f"[DAILY] Weekly summary skipped (today is not Sunday, weekday={current_day})")
+        print(f"[DAILY] Not Sunday (weekday={current_day}) — weekly skipped")
+
+    print("\n[DAILY] Pipeline complete ✓\n")
 
 
 if __name__ == "__main__":
