@@ -1,0 +1,10 @@
+feedparser
+requests
+python-dotenv
+beautifulsoup4
+lxml
+edge-tts
+flask
+google-genai
+groq
+huggingface_hub>=0.20.0
