@@ -5,6 +5,7 @@
 **Test Pass Rate**: 100% (8/8 backend test cases passing)
 **Frontend Build**: 0 Errors / 0 Warnings (Vite 6.4.3 production bundle)
 **Authentication & CSRF**: First Login Password Change Verified / Cross-Site Iframe Cookie & JWT Claim Supported
+**Telegram Delivery**: Operational / IPv4 Socket Resolution Enforced / Connect (3s) & Read (20s) Timeouts
 
 ---
 

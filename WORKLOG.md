@@ -1,6 +1,35 @@
 # JARVIS Worklog
 
-## 2026-08-02 - Authentication & CSRF First-Login Resolution
+## 2026-08-02 - Telegram Read Timeout & IPv4 Socket Enforcement Resolution
+
+Root Cause of `HTTPSConnectionPool(host='api.telegram.org', port=443): Read timed out. (read timeout=20)`:
+1. **IPv6 Socket Hanging on Cloud/Container Networks**: `api.telegram.org` returns dual-stack IPv6 (`2001:67c:4e8:f004::9`) and IPv4 (`149.154.166.110`) DNS records. Python's `socket.getaddrinfo()` returns IPv6 first. On cloud containers (Hugging Face Spaces / AWS EC2) lacking active outbound IPv6 routing, TCP connection attempts to the IPv6 address hang silently until the HTTP timeout (20-60s) expires, resulting in `Read timed out` or `Connect timed out`.
+2. **Scalar Timeout Overhead**: Requests set single scalar timeouts (`timeout=20` or `timeout=60`). When TCP connection attempts hung on IPv6, each attempt blocked the execution thread for up to 60 seconds before failing.
+3. **Edge Proxy Throttling**: Default `python-requests` User-Agent header triggered connection drops or rate-limits on cloud edge proxies.
+
+Files Created / Changed:
+- `backend/utils/telegram_client.py` (Created) — Centralized Telegram API client:
+  - Enforces IPv4 socket resolution (`urllib3.util.connection.allowed_gai_family = lambda: socket.AF_INET`).
+  - Implements automatic bot token masking (`bot***`) in logs.
+  - Uses separate connect (3.0s) and read (20.0s) timeouts with custom User-Agent (`JARVIS-Intelligence-Bot/2.0`).
+  - Detailed diagnostic logging (request start/finish, HTTP status, elapsed time in seconds, response snippet, stack trace on failure).
+- `backend/notifications/notifier.py` — Refactored `_send_one()`, `test_channel()`, and `send_audio()` to use `telegram_client`.
+- `backend/notifications/bot_listener.py` — Refactored `send_reply()`, `_delete_webhook()`, `_poll_loop()`, and `_set_commands()` to use `telegram_client`.
+- `backend/app.py` — Refactored `register_webhook()`, `delete_webhook()`, and `send_startup_message()` to use `telegram_client`.
+- `backend/utils/internet_monitor.py` — Added IPv4 socket family enforcement.
+
+Verification Performed:
+- **Telegram Verification Suite**:
+  - `getMe`: Succeeded in 0.63s (`@JarvisAkpBot`).
+  - `getUpdates`: Completed in 0.18s.
+  - `sendMessage` (direct API): Succeeded in 0.40s.
+  - `test_channel` (UI button logic): Succeeded in 0.40s.
+  - `_send_one` & `_send` notifier pipeline: Succeeded in 0.39s & 0.43s.
+- **Backend Test Suite**: `pytest tests/test_backend_api.py` (8/8 tests passing, 100% pass rate).
+
+Status: Production-Ready & Telegram Delivery Verified.
+
+---
 
 Root Cause of `csrf_failed` on First Login Password Change:
 1. **Cross-Site Iframe Cookie Restrictions**: When running embedded inside a Hugging Face Space iframe (`https://huggingface.co/spaces/akp-07/jarvis-agent` embedding `https://akp-07-jarvis-agent.hf.space`), browsers treat `huggingface.co` and `hf.space` as cross-site. Cookies set with `SameSite=Strict` are omitted by browsers on iframe requests, causing `request.cookies.get("csrf_token")` to return empty.

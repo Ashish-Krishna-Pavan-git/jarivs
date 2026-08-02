@@ -54,43 +54,14 @@ def _split(text):
     return chunks
 
 
+from backend.utils.telegram_client import telegram_post
+
+
 def _send_one(chat_id, text):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    last_error = None
-    for attempt in range(1, MAX_RETRIES+1):
-        try:
-            r = requests.post(url, json={"chat_id":chat_id,"text":text}, timeout=SEND_TIMEOUT)
-            if r.status_code==200:
-                return True
-            if r.status_code==429:
-                ra=r.json().get("parameters",{}).get("retry_after",30)
-                print(f"[NOTIFIER] Rate limited — wait {ra}s"); time.sleep(ra)
-                last_error = f"Rate limited (429), retry after {ra}s"
-            elif r.status_code in (400,403):
-                err_msg = f"Permanent error {r.status_code} for chat {chat_id}"
-                print(f"[NOTIFIER] {err_msg}")
-                _log("ERROR", f"Telegram delivery failed: HTTP {r.status_code}", chat_id=chat_id, error=str(r.text)[:200])
-                return False
-            else:
-                last_error = f"HTTP {r.status_code}"
-                time.sleep(2**attempt)
-        except requests.exceptions.SSLError as e:
-            w=2**attempt*8
-            last_error = f"SSL error: {e}"
-            print(f"[NOTIFIER] SSL error attempt {attempt}/{MAX_RETRIES}, retry {w}s"); time.sleep(w)
-        except requests.exceptions.ReadTimeout:
-            w=2**attempt*5
-            last_error = "Read timeout"
-            print(f"[NOTIFIER] Timeout attempt {attempt}/{MAX_RETRIES}, retry {w}s"); time.sleep(w)
-        except requests.exceptions.ConnectionError as e:
-            w=2**attempt*5
-            last_error = f"Connection error: {e}"
-            print(f"[NOTIFIER] Conn error attempt {attempt}/{MAX_RETRIES}, retry {w}s"); time.sleep(w)
-        except Exception as e:
-            last_error = str(e)
-            print(f"[NOTIFIER] Error: {e}"); return False
-    print(f"[NOTIFIER] ✗ All {MAX_RETRIES} retries failed for {chat_id}")
-    _log("ERROR", f"Telegram delivery failed after {MAX_RETRIES} retries", chat_id=chat_id, error=str(last_error)[:300])
+    res = telegram_post("sendMessage", TELEGRAM_TOKEN, payload={"chat_id": chat_id, "text": text}, timeout=(3.0, 20.0), max_retries=3)
+    if res.get("ok"):
+        return True
+    _log("ERROR", f"Telegram delivery failed for {chat_id}", chat_id=chat_id, error=str(res.get("error"))[:300])
     return False
 
 
@@ -350,18 +321,13 @@ def test_channel(kind, target, secret=None):
             return {"ok": False, "error": "TELEGRAM_TOKEN is not configured in .env"}
         if not target:
             return {"ok": False, "error": "Telegram chat ID is required"}
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        try:
-            r = requests.post(url, json={"chat_id": target, "text": "✅ JARVIS test message — your Telegram channel is working."}, timeout=20)
-            if r.status_code == 200:
-                _log("INFO", "Telegram test message sent", chat_id=target)
-                return {"ok": True, "message": "Test message sent successfully"}
-            body = r.text[:300]
-            _log("ERROR", "Telegram test failed", chat_id=target, status=r.status_code, error=body)
-            return {"ok": False, "error": f"Telegram API returned HTTP {r.status_code}: {body}"}
-        except Exception as exc:
-            _log("ERROR", "Telegram test error", chat_id=target, error=str(exc)[:300])
-            return {"ok": False, "error": str(exc)[:300]}
+        res = telegram_post("sendMessage", TELEGRAM_TOKEN, payload={"chat_id": target, "text": "✅ JARVIS test message — your Telegram channel is working."}, timeout=(3.0, 15.0), max_retries=2)
+        if res.get("ok"):
+            _log("INFO", "Telegram test message sent", chat_id=target)
+            return {"ok": True, "message": "Test message sent successfully"}
+        err = str(res.get("error", "Unknown error"))
+        _log("ERROR", "Telegram test failed", chat_id=target, error=err[:300])
+        return {"ok": False, "error": err[:300]}
     if kind == "slack":
         webhook = str(secret.get("webhook_url") or target or "").strip()
         if not webhook:
@@ -380,18 +346,17 @@ def test_channel(kind, target, secret=None):
     return {"ok": False, "error": f"Unknown channel kind: {kind}"}
 
 def send_audio(filepath, caption="🎙️ JARVIS Daily Audio Briefing"):
-    if not TELEGRAM_TOKEN or not os.path.exists(filepath): return False
-    url=f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendAudio"
+    if not TELEGRAM_TOKEN or not os.path.exists(filepath):
+        return False
+    ok = False
     for cid in set(_get_subs()):
-        if not cid: continue
-        for attempt in range(MAX_RETRIES):
-            try:
-                with open(filepath,"rb") as audio:
-                    r=requests.post(url,data={"chat_id":cid,"caption":caption},
-                                    files={"audio":audio},timeout=SEND_TIMEOUT)
-                if r.status_code==200: break
-                time.sleep(2**attempt*3)
-            except requests.exceptions.SSLError: time.sleep(2**attempt*8)
-            except Exception as e:
-                print(f"[NOTIFIER] Audio error: {e}"); time.sleep(2**attempt*3)
-    return True
+        if not cid:
+            continue
+        try:
+            with open(filepath, "rb") as audio:
+                res = telegram_post("sendAudio", TELEGRAM_TOKEN, payload={"chat_id": cid, "caption": caption}, files={"audio": audio}, timeout=(5.0, 60.0), max_retries=3)
+                if res.get("ok"):
+                    ok = True
+        except Exception as e:
+            print(f"[NOTIFIER] Audio error: {e}")
+    return ok

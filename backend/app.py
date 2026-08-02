@@ -989,31 +989,26 @@ def telegram_webhook(token):
     return "ok", 200
 
 
+from backend.utils.telegram_client import telegram_post
+
+
 def register_webhook() -> bool:
     if not TELEGRAM_TOKEN or not HF_SPACE_URL:
         return False
-    try:
-        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook", json={"url": f"{HF_SPACE_URL}/telegram/{TELEGRAM_TOKEN}", "drop_pending_updates": False}, timeout=25)
-        return bool(r.json().get("ok"))
-    except Exception:
-        return False
+    res = telegram_post("setWebhook", TELEGRAM_TOKEN, payload={"url": f"{HF_SPACE_URL}/telegram/{TELEGRAM_TOKEN}", "drop_pending_updates": False}, timeout=(3.0, 15.0), max_retries=2)
+    return bool(res.get("ok"))
 
 
 def delete_webhook():
     if TELEGRAM_TOKEN:
-        try:
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook", json={"drop_pending_updates": False}, timeout=15)
-        except Exception:
-            pass
+        telegram_post("deleteWebhook", TELEGRAM_TOKEN, payload={"drop_pending_updates": False}, timeout=(3.0, 12.0), max_retries=2)
 
 
 def send_startup_message():
-    if TELEGRAM_TOKEN and os.getenv("TELEGRAM_CHAT_ID"):
-        time.sleep(8)
-        try:
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": os.getenv("TELEGRAM_CHAT_ID"), "text": "JARVIS Online - intelligence system restarted."}, timeout=20)
-        except Exception:
-            pass
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    if TELEGRAM_TOKEN and chat_id:
+        time.sleep(5)
+        telegram_post("sendMessage", TELEGRAM_TOKEN, payload={"chat_id": chat_id, "text": "JARVIS Online - intelligence system restarted."}, timeout=(3.0, 15.0), max_retries=2)
 
 
 def main():

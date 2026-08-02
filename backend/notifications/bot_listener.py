@@ -18,22 +18,16 @@ from storage import load_last_n_hours
 from ai_router import local_call, local_call_text, extract_json
 from subscriber_store import load_subscribers, subscribe, unsubscribe
 
+from backend.utils.telegram_client import telegram_get, telegram_post
+
 HF_SPACE_URL     = os.getenv("HF_SPACE_URL", "").rstrip("/")
 _ALLOWED_UPDATES = ["message", "channel_post", "edited_message", "edited_channel_post"]
-
-_session = requests.Session()
-_session.mount("https://", HTTPAdapter(max_retries=Retry(
-    total=5, backoff_factor=2,
-    status_forcelist=[429, 500, 502, 503, 504],
-    allowed_methods=["GET", "POST"],
-)))
 
 
 # ─── Sender ───────────────────────────────────────────────────────────────────
 def send_reply(chat_id, text):
     if not TELEGRAM_TOKEN:
         return
-    url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     text = str(text)
     parts = [text[i:i+4000] for i in range(0, len(text), 4000)]
     for chunk in parts:
@@ -41,16 +35,11 @@ def send_reply(chat_id, text):
             payload = {"chat_id": chat_id, "text": chunk}
             if parse_mode:
                 payload["parse_mode"] = parse_mode
-            try:
-                r = _session.post(url, json=payload, timeout=40)
-                if r.status_code == 200:
-                    break
-                if r.status_code == 400 and parse_mode == "Markdown":
-                    continue
-            except Exception as e:
-                if parse_mode is None:
-                    print(f"[BOT] Reply error: {e}")
-                    time.sleep(2)
+            res = telegram_post("sendMessage", TELEGRAM_TOKEN, payload=payload, timeout=(3.0, 15.0), max_retries=1)
+            if res.get("ok"):
+                break
+            if not res.get("ok") and parse_mode == "Markdown":
+                continue
         time.sleep(0.3)
 
 
@@ -233,54 +222,43 @@ def handle_update(update):
 def _delete_webhook():
     if not TELEGRAM_TOKEN:
         return False
-    try:
-        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook",
-                          json={"drop_pending_updates":False}, timeout=12)
-        return r.status_code==200 and r.json().get("ok",False)
-    except:
-        return False
+    res = telegram_post("deleteWebhook", TELEGRAM_TOKEN, payload={"drop_pending_updates": False}, timeout=(3.0, 12.0), max_retries=2)
+    return bool(res.get("ok"))
 
 
 # ─── Poll Loop ────────────────────────────────────────────────────────────────
 def _poll_loop():
     if not TELEGRAM_TOKEN:
         return
-    url    = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
     offset = None
     consecutive_409 = 0
-    print("[BOT] Polling loop started")
+    print("[BOT] Polling loop started (IPv4 enforced)")
 
     while True:
         try:
-            params = {"timeout":15, "allowed_updates":_ALLOWED_UPDATES}
+            params = {"timeout": 15, "allowed_updates": _ALLOWED_UPDATES}
             if offset:
                 params["offset"] = offset
-            r = _session.get(url, params=params, timeout=40)
+            r = telegram_get("getUpdates", TELEGRAM_TOKEN, params=params, timeout=(3.0, 25.0), max_retries=1)
 
-            if r.status_code == 200:
+            if r.get("ok"):
                 consecutive_409 = 0
-                for upd in r.json().get("result",[]):
-                    offset = upd["update_id"]+1
+                for upd in r.get("result", []):
+                    offset = upd["update_id"] + 1
                     threading.Thread(target=handle_update, args=(upd,), daemon=True).start()
 
-            elif r.status_code == 409:
+            elif r.get("status") == 409:
                 consecutive_409 += 1
                 if _delete_webhook():
                     print(f"[BOT] ✓ 409 resolved — stale webhook deleted (attempt {consecutive_409})")
                     consecutive_409 = 0
                 else:
-                    wait = min(30*consecutive_409, 120)
+                    wait = min(30 * consecutive_409, 120)
                     print(f"[BOT] 409 unresolved — waiting {wait}s")
                     time.sleep(wait)
             else:
-                print(f"[BOT] Poll HTTP {r.status_code}")
                 time.sleep(5)
 
-        except requests.exceptions.Timeout:
-            pass
-        except requests.exceptions.ConnectionError as e:
-            print(f"[BOT] Connection error: {e}")
-            time.sleep(10)
         except Exception as e:
             print(f"[BOT] Poll error: {e}")
             time.sleep(5)
@@ -289,18 +267,19 @@ def _poll_loop():
 
 # ─── Start ────────────────────────────────────────────────────────────────────
 def _set_commands():
-    if not TELEGRAM_TOKEN: return
-    try:
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setMyCommands", json={"commands":[
-            {"command":"start",    "description":"Subscribe to JARVIS alerts"},
-            {"command":"stop",     "description":"Unsubscribe from alerts"},
-            {"command":"status",   "description":"System health & statistics"},
-            {"command":"quiz",     "description":"Daily intelligence quiz"},
-            {"command":"deepdive", "description":"Threat research dossier on any topic"},
-        ]}, timeout=15)
+    if not TELEGRAM_TOKEN:
+        return
+    res = telegram_post("setMyCommands", TELEGRAM_TOKEN, payload={
+        "commands": [
+            {"command": "start", "description": "Subscribe to JARVIS alerts"},
+            {"command": "stop", "description": "Unsubscribe from alerts"},
+            {"command": "status", "description": "System health & statistics"},
+            {"command": "quiz", "description": "Daily intelligence quiz"},
+            {"command": "deepdive", "description": "Threat research dossier on any topic"},
+        ]
+    }, timeout=(3.0, 15.0), max_retries=2)
+    if res.get("ok"):
         print("[BOT] ✓ Commands registered")
-    except Exception as e:
-        print(f"[BOT] setMyCommands failed (non-fatal): {e}")
 
 
 def start_listener():
