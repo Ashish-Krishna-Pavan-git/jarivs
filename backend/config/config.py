@@ -41,6 +41,7 @@ HF_STORAGE_REPO = os.getenv("HF_STORAGE_REPO", "")   # e.g. "AKP-07/jarvis-data"
 
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_MODE    = os.getenv("TELEGRAM_MODE", "polling") # "polling" or "webhook"
 
 # ─────────────────────────────────────────────────────────────
 # SCHEDULER

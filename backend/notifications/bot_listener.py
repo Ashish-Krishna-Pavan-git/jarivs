@@ -218,14 +218,6 @@ def handle_update(update):
         print(f"[BOT] handle_update error: {e}")
 
 
-# ─── Webhook Delete ───────────────────────────────────────────────────────────
-def _delete_webhook():
-    if not TELEGRAM_TOKEN:
-        return False
-    res = telegram_post("deleteWebhook", TELEGRAM_TOKEN, payload={"drop_pending_updates": False}, timeout=(3.0, 12.0), max_retries=2)
-    return bool(res.get("ok"))
-
-
 # ─── Poll Loop ────────────────────────────────────────────────────────────────
 def _poll_loop():
     if not TELEGRAM_TOKEN:
@@ -249,13 +241,9 @@ def _poll_loop():
 
             elif r.get("status") == 409:
                 consecutive_409 += 1
-                if _delete_webhook():
-                    print(f"[BOT] ✓ 409 resolved — stale webhook deleted (attempt {consecutive_409})")
-                    consecutive_409 = 0
-                else:
-                    wait = min(30 * consecutive_409, 120)
-                    print(f"[BOT] 409 unresolved — waiting {wait}s")
-                    time.sleep(wait)
+                wait = min(30 * consecutive_409, 120)
+                print(f"[BOT] 409 Conflict: Webhook is active. Please use the /api/admin/telegram/setup endpoint with action 'delete_webhook' to disable it. Waiting {wait}s...")
+                time.sleep(wait)
             else:
                 time.sleep(5)
 
@@ -265,10 +253,11 @@ def _poll_loop():
         time.sleep(0.3)
 
 
-# ─── Start ────────────────────────────────────────────────────────────────────
 def _set_commands():
+    from backend.config.config import TELEGRAM_TOKEN
+    from backend.utils.telegram_client import telegram_post
     if not TELEGRAM_TOKEN:
-        return
+        return False
     res = telegram_post("setMyCommands", TELEGRAM_TOKEN, payload={
         "commands": [
             {"command": "start", "description": "Subscribe to JARVIS alerts"},
@@ -278,15 +267,18 @@ def _set_commands():
             {"command": "deepdive", "description": "Threat research dossier on any topic"},
         ]
     }, timeout=(3.0, 15.0), max_retries=2)
-    if res.get("ok"):
+    ok = bool(res.get("ok"))
+    if ok:
         print("[BOT] ✓ Commands registered")
+    return ok
 
 
 def start_listener():
+    from backend.config.config import TELEGRAM_TOKEN, TELEGRAM_MODE, HF_SPACE_URL
     if not TELEGRAM_TOKEN:
         return
-    threading.Thread(target=_set_commands, daemon=True).start()
-    if HF_SPACE_URL:
+    
+    if TELEGRAM_MODE == "webhook":
         print(f"[BOT] Webhook mode — {HF_SPACE_URL}/telegram/<token>")
     else:
         threading.Thread(target=_poll_loop, daemon=True).start()

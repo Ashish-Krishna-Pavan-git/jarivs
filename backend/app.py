@@ -1025,25 +1025,48 @@ def telegram_webhook(token):
 
 
 from backend.utils.telegram_client import telegram_post
+from backend.config.config import TELEGRAM_MODE
 
 
-def register_webhook() -> bool:
-    if not TELEGRAM_TOKEN or not HF_SPACE_URL:
-        return False
-    res = telegram_post("setWebhook", TELEGRAM_TOKEN, payload={"url": f"{HF_SPACE_URL}/telegram/{TELEGRAM_TOKEN}", "drop_pending_updates": False}, timeout=(3.0, 15.0), max_retries=2)
-    return bool(res.get("ok"))
-
-
-def delete_webhook():
-    if TELEGRAM_TOKEN:
-        telegram_post("deleteWebhook", TELEGRAM_TOKEN, payload={"drop_pending_updates": False}, timeout=(3.0, 12.0), max_retries=2)
-
-
-def send_startup_message():
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    if TELEGRAM_TOKEN and chat_id:
-        time.sleep(5)
-        telegram_post("sendMessage", TELEGRAM_TOKEN, payload={"chat_id": chat_id, "text": "JARVIS Online - intelligence system restarted."}, timeout=(3.0, 15.0), max_retries=2)
+@app.route("/api/admin/telegram/setup", methods=["POST"])
+@require_admin
+@require_csrf
+def admin_telegram_setup():
+    """Manual endpoint to setup Telegram webhook or commands."""
+    try:
+        data = request.json or {}
+        action = data.get("action")  # 'set_webhook', 'delete_webhook', 'set_commands'
+        
+        if not TELEGRAM_TOKEN:
+            return jsonify({"error": "Telegram token not configured"}), 400
+            
+        if action == "set_webhook":
+            if not HF_SPACE_URL:
+                return jsonify({"error": "HF_SPACE_URL not configured"}), 400
+            res = telegram_post("setWebhook", TELEGRAM_TOKEN, payload={"url": f"{HF_SPACE_URL}/telegram/{TELEGRAM_TOKEN}", "drop_pending_updates": False}, timeout=(3.0, 15.0), max_retries=2)
+            return jsonify({"status": "ok", "result": res})
+            
+        elif action == "delete_webhook":
+            res = telegram_post("deleteWebhook", TELEGRAM_TOKEN, payload={"drop_pending_updates": False}, timeout=(3.0, 12.0), max_retries=2)
+            return jsonify({"status": "ok", "result": res})
+            
+        elif action == "set_commands":
+            res = telegram_post("setMyCommands", TELEGRAM_TOKEN, payload={
+                "commands": [
+                    {"command": "start", "description": "Subscribe to JARVIS alerts"},
+                    {"command": "stop", "description": "Unsubscribe from alerts"},
+                    {"command": "status", "description": "System health & statistics"},
+                    {"command": "quiz", "description": "Daily intelligence quiz"},
+                    {"command": "deepdive", "description": "Threat research dossier on any topic"},
+                ]
+            }, timeout=(3.0, 15.0), max_retries=2)
+            return jsonify({"status": "ok", "result": res})
+            
+        else:
+            return jsonify({"error": f"Unknown action: {action}"}), 400
+            
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
 
 
 def main():
@@ -1055,19 +1078,12 @@ def main():
     print(f"[CLOUD] Scheduler started (pid={proc.pid})")
 
     if TELEGRAM_TOKEN:
-        def _async_telegram_init():
-            time.sleep(3)
-            if HF_SPACE_URL:
-                print(f"[CLOUD] Registering Telegram webhook for {HF_SPACE_URL}...")
-                ok = register_webhook()
-                if not ok:
-                    print("[CLOUD] Webhook registration skipped/failed — using polling mode")
-                    delete_webhook()
-            else:
-                delete_webhook()
-            send_startup_message()
-
-        threading.Thread(target=_async_telegram_init, daemon=True).start()
+        print(f"[CLOUD] Telegram mode: {TELEGRAM_MODE}")
+        if TELEGRAM_MODE == "polling":
+            from backend.notifications.bot_listener import start_listener
+            start_listener()
+        elif TELEGRAM_MODE == "webhook":
+            print(f"[CLOUD] Waiting for webhook POSTs at /telegram/{TELEGRAM_TOKEN[:5]}...")
 
     port = int(os.getenv("PORT", 7860))
     app.run(host="0.0.0.0", port=port)

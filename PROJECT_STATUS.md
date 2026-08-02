@@ -9,9 +9,13 @@
 
 ---
 
-## Executive Overview
+## 1. Executive Summary
+JARVIS is a fully functional, containerized, multi-channel intelligence aggregation system. It collects articles from multiple RSS and web sources, evaluates them using local and cloud-based AI providers (Gemini, Groq, Ollama), persists data using JSON and Hugging Face Datasets, and delivers notifications via Telegram and Slack.
 
-JARVIS is a fully functional, self-hosted security intelligence aggregator, LLM-powered threat analyst, and automated report publisher. All components across ingestion, deduplication, worker processing, multi-tier AI routing, reporting, multi-channel notification delivery, storage, WordPress publishing, Hugging Face Docker Space hosting, robust CSRF protection, and administrative control are operational, tested, and documented.
+**Latest Milestone (2026-08-02):**
+- ✅ Decoupled Telegram and Slack Notification Engine (Robust multi-channel delivery)
+- ✅ Implemented low-level non-blocking network diagnostics (`tools/network_diagnostics.py`)
+- ✅ **Redesigned Telegram Startup Architecture**: Completely eradicated automatic webhook setup hooks from the application boot sequence to prevent 409 Webhook Conflicts and IPv6 DNS timeouts on Hugging Face Spaces. Introduced explicit polling/webhook modes and an admin API (`/api/admin/telegram/setup`) for manual configuration.
 
 ---
 

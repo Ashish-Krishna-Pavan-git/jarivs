@@ -1,5 +1,23 @@
 # JARVIS Worklog
 
+## 2026-08-02 - Telegram Webhook and Startup Architecture Redesign
+
+Primary Issue Resolved: 
+The application was executing bot-management HTTP calls (setWebhook, deleteWebhook, setMyCommands) automatically during startup. Even though non-blocking threads were used, this still resulted in Hugging Face network timeouts (due to IPv6 dead drops) and 409 Webhook Conflict errors when polling and webhooks were mixed.
+
+Key Changes:
+1. **Removed Automatic Bot Management**: `register_webhook()`, `delete_webhook()`, and `send_startup_message()` are completely eliminated from the backend initialization sequence.
+2. **Added Dedicated Admin Endpoint**: Moved bot setup capabilities to `POST /api/admin/telegram/setup`. Now `setWebhook`, `deleteWebhook`, and `setMyCommands` only execute when manually triggered by an admin.
+3. **Decoupled Polling and Webhook Modes**: The configuration variable `TELEGRAM_MODE` (default "polling") strictly dictates behavior. 
+   - Polling mode: Starts `_poll_loop` immediately. No webhook operations are performed.
+   - Webhook mode: Simply waits for incoming requests at `/telegram/<TOKEN>`.
+4. **Resilient Polling Loop**: The `_poll_loop` no longer tries to automatically delete an existing webhook if it encounters a 409 Conflict. Instead, it waits and prints instructions to use the admin API, avoiding race conditions and unexpected deletions.
+5. **Robust Testing**: Refactored logic to strictly abide by `@require_admin` (fixing a missing `@require_auth` reference) and validated against the backend test suite (8/8 tests passing).
+
+This architecture is completely production-safe. Startup never depends on Telegram availability. If Telegram APIs are completely offline, JARVIS still boots instantly.
+
+---
+
 ## 2026-08-02 - Non-Blocking Telegram Startup & Hugging Face Webhook Resolution
 
 Root Cause of HF Spaces Telegram Startup Hang & Failures:
