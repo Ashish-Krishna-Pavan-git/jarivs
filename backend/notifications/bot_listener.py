@@ -274,8 +274,12 @@ def _set_commands():
 
 
 def start_listener():
-    from backend.config.config import TELEGRAM_TOKEN, TELEGRAM_MODE
+    from backend.config.config import IS_TELEGRAM_ENABLED, TELEGRAM_TOKEN, TELEGRAM_MODE
+    if not IS_TELEGRAM_ENABLED:
+        print("[TELEGRAM] Disabled by configuration — listener not started.")
+        return
     if not TELEGRAM_TOKEN:
+        print("[TELEGRAM] Token not set — listener not started.")
         return
     
     if TELEGRAM_MODE == "webhook":

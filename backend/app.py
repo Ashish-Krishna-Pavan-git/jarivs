@@ -419,6 +419,17 @@ def admin_channel_test():
     return jsonify(test_channel(str(data.get("kind", "")), str(data.get("target", "")), data.get("secret") or {}))
 
 
+@app.route("/api/admin/notification-provider", methods=["GET", "POST"])
+@require_admin
+def admin_notification_provider():
+    from backend.config.config import get_notification_provider_info, set_notification_provider
+    if request.method == "GET":
+        return jsonify(get_notification_provider_info())
+    data = request.json or {}
+    res = set_notification_provider(data.get("provider"))
+    return jsonify(res)
+
+
 @app.route("/api/admin/ai-status")
 @require_admin
 def ai_status():
@@ -1159,11 +1170,18 @@ def main():
     if is_configured():
         pull_state()
 
+    from backend.config.config import NOTIFICATION_PROVIDER, IS_TELEGRAM_ENABLED
+    prov_display = NOTIFICATION_PROVIDER.capitalize()
+    print(f"[CLOUD] Notification Provider: {prov_display}")
+    if not IS_TELEGRAM_ENABLED:
+        print("[TELEGRAM] Disabled by configuration")
+    else:
+        print(f"[CLOUD] Telegram mode: {TELEGRAM_MODE}")
+
     proc = subprocess.Popen([sys.executable, "scheduler.py"], env=os.environ.copy())
     print(f"[CLOUD] Scheduler started (pid={proc.pid})")
 
-    if TELEGRAM_TOKEN:
-        print(f"[CLOUD] Telegram mode: {TELEGRAM_MODE}")
+    if IS_TELEGRAM_ENABLED and TELEGRAM_TOKEN:
         if TELEGRAM_MODE == "polling":
             from backend.notifications.bot_listener import start_listener
             start_listener()

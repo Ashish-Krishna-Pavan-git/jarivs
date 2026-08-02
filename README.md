@@ -15,12 +15,11 @@ app_port: 7860
 pinned: false
 ---
 
->>>>>>> 5036268 (Fix Hugging Face deployment)
 # JARVIS Intelligence System
 
 > Self-hosted AI-powered threat intelligence aggregator, analyst, and publisher.
 
-JARVIS collects security and technology articles from RSS feeds, analyzes them with configurable LLMs (Gemini, Groq, Ollama, custom OpenAI-compatible providers), generates daily digests and executive reports, delivers alerts via Telegram and Slack, and publishes formatted reports to WordPress — automatically on a schedule.
+JARVIS collects security and technology articles from RSS feeds, analyzes them with configurable LLMs (Gemini, Groq, Ollama, custom OpenAI-compatible providers), generates daily digests and executive reports, delivers alerts via Slack and/or Telegram, and publishes formatted reports to WordPress — automatically on a schedule.
 
 ---
 
@@ -81,8 +80,7 @@ The scheduler runs as a subprocess and starts automatically.
 | **AI Analysis** | Routes each article through a priority-ordered LLM chain for categorization, severity scoring, CVE extraction, and summary |
 | **Cycle Digests** | After each collection cycle, generates a structured threat digest |
 | **Daily Report** | Every morning at 07:00 IST, synthesizes all cycle digests into an executive daily report |
-| **Telegram Alerts** | Sends CRITICAL/HIGH alerts immediately; digest summaries after each cycle |
-| **Slack Alerts** | Mirrors Telegram alerts to a Slack webhook |
+| **Notification Engine** | Flexible provider routing (`NOTIFICATION_PROVIDER=slack|telegram|both|none`). Slack is primary on HF; Telegram is optional. |
 | **Audio Podcast** | Text-to-speech daily report sent to Telegram as an audio file |
 | **WordPress Publishing** | Publishes the daily report as a formatted HTML post via WordPress REST API |
 | **Admin Dashboard** | Manage feeds, AI models, users, notifications, MCP, and logs through a React UI |

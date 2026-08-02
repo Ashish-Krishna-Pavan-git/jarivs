@@ -1,5 +1,25 @@
 # JARVIS Worklog
 
+## 2026-08-03 - Decoupled Provider-Agnostic Notification Architecture (Slack Primary, Telegram Optional)
+
+Primary Goal:
+Ensure JARVIS runs with 100% reliability on Hugging Face Spaces and cloud container environments without being blocked or failing due to Telegram network timeouts or container IPv6 egress restrictions.
+
+Key Architectural Changes:
+1. **Configurable Provider Routing**: Introduced `NOTIFICATION_PROVIDER=slack|telegram|both|none` configuration flag in `backend/config/config.py`.
+   - **Hugging Face Default**: `NOTIFICATION_PROVIDER=slack` (Slack is primary, Telegram disabled by default).
+   - **Local Dev Default**: `NOTIFICATION_PROVIDER=both`.
+2. **Complete Isolation when Telegram is Disabled**:
+   - Polling loops, webhooks, `getUpdates`, `sendMessage`, and Telegram background threads are completely bypassed.
+   - Startup outputs `[CLOUD] Notification Provider: Slack` and `[TELEGRAM] Disabled by configuration`.
+3. **Provider-Agnostic Notifier (`backend/notifications/notifier.py`)**:
+   - `_send_multichannel()` checks `IS_SLACK_ENABLED` and `IS_TELEGRAM_ENABLED` independently.
+   - Failures or timeouts in one provider never impact or block another provider.
+4. **Admin UI & Testing**:
+   - Added Notification Provider Selector in `Channels.jsx` UI and backend API `GET/POST /api/admin/notification-provider`.
+   - Test buttons properly report `"Telegram is disabled in this deployment."` when Telegram is turned off.
+5. **Preserved All Code**: All Telegram handlers, polling logic, and send functions remain intact and fully functional when enabled.
+
 ## 2026-08-03 - Telegram Network Timeout Policies and Duplicate Fixes
 
 Primary Issue Resolved: 

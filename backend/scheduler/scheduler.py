@@ -193,10 +193,15 @@ def _boot():
 def main():
     print(f"\n[SCHED] ====== JARVIS Scheduler ======\n[SCHED] {fmt_ist()}")
 
-    try:
-        from bot_listener import start_listener; start_listener()
-    except Exception as e:
-        print(f"[SCHED] Bot failed: {e}"); traceback.print_exc()
+    from backend.config.config import IS_TELEGRAM_ENABLED, NOTIFICATION_PROVIDER
+    print(f"[SCHED] Notification Provider: {NOTIFICATION_PROVIDER.capitalize()}")
+    if IS_TELEGRAM_ENABLED:
+        try:
+            from bot_listener import start_listener; start_listener()
+        except Exception as e:
+            print(f"[SCHED] Bot failed: {e}"); traceback.print_exc()
+    else:
+        print("[TELEGRAM] Disabled by configuration — skipping bot listener")
 
     _state(phase="idle",current_cycle_number=0,current_cycle_slot=None,
            next_cycle_at_ist=fmt_ist(_next_cycle()),

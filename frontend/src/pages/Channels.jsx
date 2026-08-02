@@ -8,9 +8,12 @@ export function Channels({ userMode = false }) {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const [testResults, setTestResults] = useState({});
+  const [providerInfo, setProviderInfo] = useState({ provider: "slack", slack_enabled: true, telegram_enabled: false });
+  const [savingProvider, setSavingProvider] = useState(false);
   const [f, setF] = useState({ kind: "telegram", label: "", target: "", enabled: true });
   const base = userMode ? "/api/user/notification-channels" : "/api/admin/notification-channels";
   const testUrl = userMode ? "/api/user/notification-channels/test" : "/api/admin/notification-channels/test";
+  const providerUrl = userMode ? "/api/user/notification-provider" : "/api/admin/notification-provider";
 
   const load = () => {
     setError("");
@@ -24,9 +27,28 @@ export function Channels({ userMode = false }) {
         setError(e.message);
         setLoading(false);
       });
+    api(providerUrl)
+      .then((d) => setProviderInfo(d))
+      .catch(() => {});
   };
 
-  useEffect(load, [base]);
+  useEffect(load, [base, providerUrl]);
+
+  const updateProvider = (newProvider) => {
+    setSavingProvider(true);
+    api(providerUrl, {
+      method: "POST",
+      body: JSON.stringify({ provider: newProvider }),
+    })
+      .then((res) => {
+        setProviderInfo(res);
+        setSavingProvider(false);
+      })
+      .catch((e) => {
+        setError(e.message);
+        setSavingProvider(false);
+      });
+  };
 
   const save = () => {
     setError("");
@@ -107,6 +129,32 @@ export function Channels({ userMode = false }) {
         }
       />
       {error && <p className="error">{error}</p>}
+      <div className="panel" style={{ marginBottom: "1.5rem" }}>
+        <h2>Notification Provider Configuration</h2>
+        <p className="muted" style={{ marginBottom: "1rem" }}>
+          Select which notification systems are active for automated alerts and briefings.
+          {providerInfo.is_hf && " (Hugging Face default: Slack)"}
+        </p>
+        <div style={{ display: "flex", gap: "1rem", alignItems: "center", flexWrap: "wrap" }}>
+          <Field label="Active Provider">
+            <select
+              value={providerInfo.provider || "slack"}
+              disabled={savingProvider}
+              onChange={(e) => updateProvider(e.target.value)}
+              style={{ minWidth: "160px" }}
+            >
+              <option value="slack">Slack Only (Primary)</option>
+              <option value="telegram">Telegram Only</option>
+              <option value="both">Both (Slack & Telegram)</option>
+              <option value="none">Disabled</option>
+            </select>
+          </Field>
+          <div style={{ fontSize: "0.85rem", color: "#a0aec0", marginTop: "1rem" }}>
+            Status: <strong>Slack: {providerInfo.slack_enabled ? "Enabled ✅" : "Disabled ❌"}</strong> |{" "}
+            <strong>Telegram: {providerInfo.telegram_enabled ? "Enabled ✅" : "Disabled ❌"}</strong>
+          </div>
+        </div>
+      </div>
       <div className="panel guide-grid">
         <div>
           <h2>Setup Guide</h2>

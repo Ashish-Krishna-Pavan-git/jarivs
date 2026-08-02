@@ -36,12 +36,70 @@ HF_TOKEN        = os.getenv("HF_TOKEN", "")
 HF_STORAGE_REPO = os.getenv("HF_STORAGE_REPO", "")   # e.g. "AKP-07/jarvis-data"
 
 # ─────────────────────────────────────────────────────────────
-# TELEGRAM
+# NOTIFICATION ARCHITECTURE (SLACK PRIMARY, TELEGRAM OPTIONAL)
 # ─────────────────────────────────────────────────────────────
 
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 TELEGRAM_MODE    = os.getenv("TELEGRAM_MODE", "polling") # "polling" or "webhook"
+
+def _resolve_notification_provider() -> str:
+    env_prov = os.getenv("NOTIFICATION_PROVIDER", "").strip().lower()
+    if env_prov in ("slack", "telegram", "both", "none"):
+        return env_prov
+        
+    if os.getenv("ENABLE_TELEGRAM") is not None or os.getenv("ENABLE_SLACK") is not None:
+        enable_tg = os.getenv("ENABLE_TELEGRAM", "").strip().lower() in ("true", "1", "yes")
+        enable_sl = os.getenv("ENABLE_SLACK", "true").strip().lower() in ("true", "1", "yes")
+        if enable_tg and enable_sl: return "both"
+        elif enable_tg: return "telegram"
+        elif enable_sl: return "slack"
+        else: return "none"
+        
+    try:
+        if os.path.exists("runtime_state.json"):
+            with open("runtime_state.json", encoding="utf-8") as f:
+                saved = json.load(f).get("notification_provider")
+                if saved in ("slack", "telegram", "both", "none"):
+                    return saved
+    except Exception:
+        pass
+
+    if IS_HF or os.getenv("HF_SPACE_URL") or os.getenv("SPACE_ID"):
+        return "slack"
+    return "both"
+
+NOTIFICATION_PROVIDER = _resolve_notification_provider()
+IS_SLACK_ENABLED = NOTIFICATION_PROVIDER in ("slack", "both")
+IS_TELEGRAM_ENABLED = NOTIFICATION_PROVIDER in ("telegram", "both")
+
+def get_notification_provider_info() -> dict:
+    prov = _resolve_notification_provider()
+    return {
+        "provider": prov,
+        "slack_enabled": prov in ("slack", "both"),
+        "telegram_enabled": prov in ("telegram", "both"),
+        "is_hf": IS_HF or bool(os.getenv("HF_SPACE_URL") or os.getenv("SPACE_ID")),
+    }
+
+def set_notification_provider(provider: str) -> dict:
+    provider = str(provider or "").strip().lower()
+    if provider not in ("slack", "telegram", "both", "none"):
+        return {"ok": False, "error": f"Invalid provider '{provider}'. Must be slack, telegram, both, or none."}
+    
+    os.environ["NOTIFICATION_PROVIDER"] = provider
+    try:
+        from runtime_state import update_runtime_state
+        update_runtime_state(notification_provider=provider)
+    except Exception:
+        pass
+    
+    global NOTIFICATION_PROVIDER, IS_SLACK_ENABLED, IS_TELEGRAM_ENABLED
+    NOTIFICATION_PROVIDER = provider
+    IS_SLACK_ENABLED = provider in ("slack", "both")
+    IS_TELEGRAM_ENABLED = provider in ("telegram", "both")
+    
+    return {"ok": True, "provider": provider, "slack_enabled": IS_SLACK_ENABLED, "telegram_enabled": IS_TELEGRAM_ENABLED}
 
 # ─────────────────────────────────────────────────────────────
 # SCHEDULER

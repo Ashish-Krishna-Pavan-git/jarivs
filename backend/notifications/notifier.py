@@ -66,6 +66,10 @@ def _send_one(chat_id, text):
 
 
 def _send(text):
+    from backend.config.config import IS_TELEGRAM_ENABLED
+    if not IS_TELEGRAM_ENABLED:
+        _log("INFO", "Telegram send skipped: Telegram is disabled by configuration")
+        return False
     if not TELEGRAM_TOKEN:
         _log("WARN", "Telegram send skipped: TELEGRAM_TOKEN not configured")
         return False
@@ -89,25 +93,38 @@ def _send_async(text):
 
 
 def _send_multichannel(text):
+    from backend.config.config import IS_TELEGRAM_ENABLED, IS_SLACK_ENABLED
     tg_ok = False
     slack_ok = False
 
-    # 1. Telegram delivery
-    try:
-        tg_ok = _send(text)
-    except Exception as exc:
-        print(f"[NOTIFIER] Telegram error: {exc}")
-        _log("ERROR", f"Telegram error in multichannel send: {exc}")
+    # 1. Telegram delivery (only if enabled)
+    if IS_TELEGRAM_ENABLED:
+        try:
+            tg_ok = _send(text)
+        except Exception as exc:
+            print(f"[NOTIFIER] Telegram error: {exc}")
+            _log("ERROR", f"Telegram error in multichannel send: {exc}")
+    else:
+        print("[NOTIFIER] Telegram disabled by configuration — skipping")
 
-    # 2. Slack delivery
-    try:
-        from slack_notifier import send_slack_message
-        slack_ok = send_slack_message(text)
-    except Exception as exc:
-        print(f"[NOTIFIER] Slack error: {exc}")
-        _log("ERROR", f"Slack error in multichannel send: {exc}")
+    # 2. Slack delivery (only if enabled)
+    if IS_SLACK_ENABLED:
+        try:
+            from slack_notifier import send_slack_message
+            slack_ok = send_slack_message(text)
+        except Exception as exc:
+            print(f"[NOTIFIER] Slack error: {exc}")
+            _log("ERROR", f"Slack error in multichannel send: {exc}")
+    else:
+        print("[NOTIFIER] Slack disabled by configuration — skipping")
 
-    return tg_ok or slack_ok
+    if IS_TELEGRAM_ENABLED and IS_SLACK_ENABLED:
+        return tg_ok or slack_ok
+    elif IS_TELEGRAM_ENABLED:
+        return tg_ok
+    elif IS_SLACK_ENABLED:
+        return slack_ok
+    return True
 
 
 def _send_multichannel_async(text):
@@ -330,10 +347,13 @@ def test_channel(kind, target, secret=None):
 
     Used by the admin/user UI "Test" button so delivery failures are visible.
     """
+    from backend.config.config import IS_TELEGRAM_ENABLED, IS_SLACK_ENABLED
     kind = str(kind or "").lower().strip()
     target = str(target or "").strip()
     secret = secret or {}
     if kind == "telegram":
+        if not IS_TELEGRAM_ENABLED:
+            return {"ok": False, "error": "Telegram is disabled in this deployment."}
         if not TELEGRAM_TOKEN:
             return {"ok": False, "error": "TELEGRAM_TOKEN is not configured in .env"}
         if not target:
@@ -346,6 +366,8 @@ def test_channel(kind, target, secret=None):
         _log("ERROR", "Telegram test failed", chat_id=target, error=err[:300])
         return {"ok": False, "error": err[:300]}
     if kind == "slack":
+        if not IS_SLACK_ENABLED:
+            return {"ok": False, "error": "Slack is disabled in this deployment."}
         webhook = str(secret.get("webhook_url") or target or "").strip()
         if not webhook:
             return {"ok": False, "error": "Slack webhook URL is required"}
