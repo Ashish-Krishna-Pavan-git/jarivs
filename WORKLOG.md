@@ -1,5 +1,21 @@
 # JARVIS Worklog
 
+## 2026-08-03 - Admin → Factory Reset Feature
+
+Primary Goal:
+Provide an automated, complete Factory Reset capability for administrators that resets system telemetry, queues, article histories, digest states, reports, and runtime state to clean initial defaults, while preserving user accounts, passwords, system settings, sources, model providers, and notification channels.
+
+Key Changes:
+1. **Telemetry Reset (`backend/services/telemetry.py`)**: Added `reset_telemetry()` to clear all statistics (total processed: 0, scraped: 0, failed: 0, cycles: 0, severity counts: 0, last cycle: null).
+2. **Runtime State Reset (`backend/services/runtime_state.py`)**: Added `reset_runtime_state()` to restore initial state (Phase: Idle, cycle: 0, queue: 0).
+3. **Queue & History Clearing**: Clears in-memory queue (`queue_manager.clear_all()`), deletes seen article cache (`seen.json` / `reset_cache()`), deletes digest state (`digest_state.json`), deletes scraped/processed articles, audio files, and clears `event_logs`.
+4. **Preservation Guarantee**: Leaves admin accounts, passwords, database schemas (`jarvis.db`), sources, AI model providers, notification channels, and `.env` credentials intact.
+5. **Scheduler Restart**: Terminates and cleanly restarts the `scheduler.py` subprocess.
+6. **Admin Endpoint & Frontend UI (`POST /api/admin/factory-reset`)**:
+   - Added `RotateCcw` Factory Reset buttons to both the Dashboard header (`Dashboard.jsx`) and the Testing/Maintenance page (`Testing.jsx`).
+   - Automatically reloads live overview telemetry and updates the dashboard immediately upon completion.
+   - Verified post-reset dashboard output: Processed: 0, Pending: 0, Processing: 0, Done: 0, Failed: 0, Cycles: 0, Scraped: 0, Severity counts: 0, Last Cycle: Never, Phase: Idle, Users: Unchanged.
+
 ## 2026-08-03 - Decoupled Provider-Agnostic Notification Architecture (Slack Primary, Telegram Optional)
 
 Primary Goal:

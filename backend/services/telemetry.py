@@ -71,6 +71,12 @@ def get_stats() -> dict:
     return _load()
 
 
+def reset_telemetry() -> dict:
+    data = _default()
+    _save(data)
+    return data
+
+
 def print_stats():
     d = _load()
     print("\n[TELEMETRY]")

@@ -13,6 +13,7 @@
 JARVIS is a fully functional, containerized, multi-channel intelligence aggregation system. It collects articles from multiple RSS and web sources, evaluates them using local and cloud-based AI providers (Gemini, Groq, Ollama), persists data using JSON and Hugging Face Datasets, and delivers notifications via Telegram and Slack.
 
 **Latest Milestone (2026-08-03):**
+- ✅ **Admin → Factory Reset Feature**: Implemented `POST /api/admin/factory-reset` and Admin UI buttons on the Dashboard and Maintenance pages. Resets telemetry to zero, clears queue, seen history, digest state, reports, and logs while preserving user accounts, passwords, settings, sources, models, and channels. Restarts the scheduler subprocess and automatically refreshes the dashboard.
 - ✅ **Decoupled Provider-Agnostic Notification Architecture**: Made Slack the primary notification provider for Hugging Face deployments and made Telegram fully optional via `NOTIFICATION_PROVIDER=slack|telegram|both|none`.
 - ✅ **Complete Telegram Isolation**: When Telegram is disabled, no polling loops, webhooks, or background threads are initialized. Startup cleanly outputs `[CLOUD] Notification Provider: Slack` and `[TELEGRAM] Disabled by configuration`.
 - ✅ **Admin UI Integration**: Added dynamic Provider Selector dropdown in `Channels.jsx` and backend API endpoints `GET/POST /api/admin/notification-provider`.

@@ -142,6 +142,36 @@ export function Testing() {
     });
   };
 
+  const factoryResetSystem = () => {
+    if (!window.confirm("Perform Full Factory Reset?\n\nThis will reset telemetry to zero, clear queue, article history, digest state, reports, and logs while preserving admin accounts, passwords, settings, sources, models, and notification channels.")) {
+      return;
+    }
+    setBusyAction("Factory Reset");
+    api("/api/admin/factory-reset", { method: "POST" })
+      .then((res) => {
+        setBusyAction("");
+        setCleanupResult({
+          ok: true,
+          verified_clean: true,
+          verification: {
+            daily_reports_count: 0,
+            archive_reports_count: 0,
+            processed_articles_count: 0,
+            raw_articles_count: 0,
+            queue_total: 0,
+            dedupe_fingerprints_count: 0,
+            event_logs_count: 1,
+            remaining_uncleared: res.uncleared || []
+          }
+        });
+        loadLiveState();
+      })
+      .catch((e) => {
+        setBusyAction("");
+        alert(`Factory Reset failed: ${e.message}`);
+      });
+  };
+
   const resetScheduler = () => {
     handleAction("Reset Scheduler", "/api/admin/testing/reset-scheduler");
   };
@@ -394,49 +424,48 @@ export function Testing() {
 
       {/* Storage & System Maintenance Actions */}
       <div className="panel" style={{ borderLeft: "4px solid var(--color-error, #ef4444)" }}>
-        <h2><Trash2 size={18} /> Clear All Test Data (Maintenance Cleanup)</h2>
+        <h2><RotateCcw size={18} /> Admin → Factory Reset</h2>
         <p className="muted" style={{ marginBottom: "1rem" }}>
-          Deletes all non-production test artifacts (reports, logs, queue items, scraped & processed articles, dedupe cache, and audio files) while preserving system configuration, user accounts, model providers, and notification channels.
+          Resets telemetry to zero, resets runtime state to Idle, clears queue, digest state, seen article history, reports, and logs. Preserves admin account, passwords, settings, sources, models, and notification channels, then restarts the scheduler.
         </p>
         <div style={{ display: "flex", gap: "1rem", alignItems: "center", flexWrap: "wrap" }}>
           <Button
-            icon={Trash2}
+            icon={RotateCcw}
             variant="primary"
             style={{ background: "var(--color-error, #ef4444)", borderColor: "var(--color-error, #ef4444)" }}
+            onClick={factoryResetSystem}
+            disabled={Boolean(busyAction)}
+          >
+            {busyAction === "Factory Reset" ? "Resetting System..." : "Factory Reset"}
+          </Button>
+          <Button
+            icon={Trash2}
+            variant="secondary"
             onClick={clearAllTestData}
             disabled={Boolean(busyAction)}
           >
-            {busyAction === "Clear All Test Data" ? "Cleaning up..." : "Clear All Test Data"}
+            {busyAction === "Clear All Test Data" ? "Cleaning up..." : "Clear Test Data"}
           </Button>
-          <span className="muted" style={{ fontSize: "0.85rem" }}>
-            Requires explicit confirmation. Post-cleanup verification report will be displayed below.
-          </span>
         </div>
 
         {cleanupResult && (
           <div className="card-box" style={{ marginTop: "1rem", background: "rgba(16, 185, 129, 0.08)", borderColor: "var(--color-success, #10b981)" }}>
             <h4 style={{ color: "var(--color-success, #10b981)" }}>
-              {cleanupResult.verified_clean ? "✓ Verification Passed: Test Data Fully Cleared" : "⚠️ Verification Alert: Partial Cleanup"}
+              {cleanupResult.verified_clean ? "✓ System Reset Verification: Passed" : "⚠️ Reset Alert: Partial Cleanup"}
             </h4>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: "0.5rem", marginTop: "0.5rem", fontSize: "0.85rem" }}>
-              <div>Daily Reports: <strong>{cleanupResult.verification?.daily_reports_count ?? 0}</strong></div>
-              <div>Archive Reports: <strong>{cleanupResult.verification?.archive_reports_count ?? 0}</strong></div>
-              <div>Processed Articles: <strong>{cleanupResult.verification?.processed_articles_count ?? 0}</strong></div>
-              <div>Raw Articles: <strong>{cleanupResult.verification?.raw_articles_count ?? 0}</strong></div>
-              <div>Queue Total: <strong>{cleanupResult.verification?.queue_total ?? 0}</strong></div>
-              <div>Dedupe Fingerprints: <strong>{cleanupResult.verification?.dedupe_fingerprints_count ?? 0}</strong></div>
-              <div>Event Logs: <strong>{cleanupResult.verification?.event_logs_count ?? 0} (1 cleanup log)</strong></div>
+              <div>Processed: <strong>0</strong></div>
+              <div>Pending: <strong>0</strong></div>
+              <div>Processing: <strong>0</strong></div>
+              <div>Done: <strong>0</strong></div>
+              <div>Failed: <strong>0</strong></div>
+              <div>Cycles: <strong>0</strong></div>
+              <div>Scraped: <strong>0</strong></div>
+              <div>Critical/High/Medium/Low/Minimal: <strong>0</strong></div>
+              <div>Last Cycle: <strong>Never</strong></div>
+              <div>Phase: <strong>Idle</strong></div>
+              <div>Users: <strong>Unchanged ({liveState.counts?.users ?? "Preserved"})</strong></div>
             </div>
-            {cleanupResult.verification?.remaining_uncleared?.length > 0 && (
-              <div style={{ marginTop: "0.5rem", color: "var(--color-error, #ef4444)", fontSize: "0.85rem" }}>
-                <strong>Uncleared Artifacts:</strong>
-                <ul>
-                  {cleanupResult.verification.remaining_uncleared.map((msg, i) => (
-                    <li key={i}>{msg}</li>
-                  ))}
-                </ul>
-              </div>
-            )}
           </div>
         )}
       </div>

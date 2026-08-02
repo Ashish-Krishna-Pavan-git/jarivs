@@ -73,3 +73,15 @@ def update_runtime_state(**kwargs):
                 json.dump(state, f, indent=2)
         except Exception as e:
             print(f"[RUNTIME_STATE] Write error: {e}")
+
+
+def reset_runtime_state() -> dict:
+    """Reset the persisted runtime state to initial defaults."""
+    with _lock:
+        state = _default()
+        try:
+            with open(RUNTIME_STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(state, f, indent=2)
+        except Exception as e:
+            print(f"[RUNTIME_STATE] Reset error: {e}")
+        return state

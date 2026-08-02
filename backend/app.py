@@ -852,6 +852,129 @@ def testing_reload_config():
     return jsonify({"ok": True})
 
 
+_scheduler_proc = None
+
+
+def restart_scheduler():
+    global _scheduler_proc
+    if _scheduler_proc and _scheduler_proc.poll() is None:
+        try:
+            _scheduler_proc.terminate()
+            _scheduler_proc.wait(timeout=3)
+        except Exception:
+            try:
+                _scheduler_proc.kill()
+            except Exception:
+                pass
+    _scheduler_proc = subprocess.Popen([sys.executable, "scheduler.py"], env=os.environ.copy())
+    print(f"[CLOUD] Scheduler process started (pid={_scheduler_proc.pid})")
+    return _scheduler_proc.pid
+
+
+@app.route("/api/admin/factory-reset", methods=["POST"])
+@require_admin
+@require_csrf
+def admin_factory_reset():
+    """Perform a full Factory Reset:
+    - Resets telemetry to zero
+    - Resets runtime state to defaults (Phase: Idle)
+    - Clears queue, seen article history, digest state, reports, logs, and scraped data
+    - Preserves admin account, passwords, settings, sources, models, and notification channels
+    - Restarts the scheduler
+    """
+    from config import ARCHIVE_DIR, DAILY_DIR, DATA_DIR, DIGEST_STATE_FILE, PROCESSED_DIR, RAW_DIR, SEEN_FILE
+    from dedupe import reset_cache, seen_count
+    from jarvis_db import clear_logs, list_model_providers, list_notification_channels, list_sources, list_users, log_event
+    from queue_manager import clear_all as clear_queue_all, stats as queue_stats
+    from runtime_state import reset_runtime_state
+    from telemetry import reset_telemetry
+
+    uncleared = []
+
+    # 1. Reset Telemetry
+    try:
+        reset_telemetry()
+    except Exception as exc:
+        uncleared.append(f"Telemetry reset: {exc}")
+
+    # 2. Reset Runtime State
+    try:
+        reset_runtime_state()
+    except Exception as exc:
+        uncleared.append(f"Runtime state reset: {exc}")
+
+    # 3. Clear Queue
+    try:
+        clear_queue_all()
+    except Exception as exc:
+        uncleared.append(f"Queue clear: {exc}")
+
+    # 4. Clear Seen Articles (Cache & File)
+    p_seen = Path(SEEN_FILE)
+    if p_seen.exists():
+        try:
+            p_seen.unlink()
+        except Exception as exc:
+            uncleared.append(f"Seen file: {exc}")
+    try:
+        reset_cache()
+    except Exception as exc:
+        uncleared.append(f"Dedupe cache: {exc}")
+
+    # 5. Clear Digest State
+    p_digest = Path(DIGEST_STATE_FILE)
+    if p_digest.exists():
+        try:
+            p_digest.unlink()
+        except Exception as exc:
+            uncleared.append(f"Digest state file: {exc}")
+
+    # 6. Clear Reports, Processed & Raw Articles, Audio Files
+    for d in [DAILY_DIR, ARCHIVE_DIR, PROCESSED_DIR, RAW_DIR, Path(DATA_DIR) / "audio"]:
+        p = Path(d)
+        if p.exists():
+            for item in list(p.rglob("*")):
+                if item.is_file():
+                    try:
+                        item.unlink()
+                    except Exception as exc:
+                        uncleared.append(f"File {item.name}: {exc}")
+            for sub in list(p.rglob("*"))[::-1]:
+                if sub.is_dir():
+                    try:
+                        sub.rmdir()
+                    except Exception:
+                        pass
+
+    # 7. Clear Event Logs
+    try:
+        clear_logs()
+    except Exception as exc:
+        uncleared.append(f"Event logs: {exc}")
+
+    # 8. Restart Scheduler Subprocess
+    new_pid = None
+    try:
+        new_pid = restart_scheduler()
+    except Exception as exc:
+        uncleared.append(f"Scheduler restart: {exc}")
+
+    log_event("INFO", "factory_reset", "Factory Reset executed by admin", {"scheduler_pid": new_pid, "uncleared": uncleared})
+
+    return jsonify({
+        "ok": True,
+        "message": "Factory Reset completed successfully.",
+        "scheduler_pid": new_pid,
+        "preserved": {
+            "users_count": len(list_users()),
+            "sources_count": len(list_sources()),
+            "models_count": len(list_model_providers()),
+            "channels_count": len(list_notification_channels(include_disabled=True)),
+        },
+        "uncleared": uncleared
+    })
+
+
 @app.route("/api/user/reports/<path:report_id>/export")
 @require_user
 def export_report(report_id):
@@ -1166,6 +1289,7 @@ def admin_telegram_setup():
 
 
 def main():
+    global _scheduler_proc
     print("[CLOUD] Starting JARVIS backend...")
     if is_configured():
         pull_state()
@@ -1178,8 +1302,8 @@ def main():
     else:
         print(f"[CLOUD] Telegram mode: {TELEGRAM_MODE}")
 
-    proc = subprocess.Popen([sys.executable, "scheduler.py"], env=os.environ.copy())
-    print(f"[CLOUD] Scheduler started (pid={proc.pid})")
+    _scheduler_proc = subprocess.Popen([sys.executable, "scheduler.py"], env=os.environ.copy())
+    print(f"[CLOUD] Scheduler started (pid={_scheduler_proc.pid})")
 
     if IS_TELEGRAM_ENABLED and TELEGRAM_TOKEN:
         if TELEGRAM_MODE == "polling":

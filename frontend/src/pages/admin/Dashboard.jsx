@@ -1,5 +1,5 @@
 import { useEffect, useState, useRef } from "react";
-import { Activity, Brain, Play, RefreshCw, Rss, Users, Clock, Cpu, Zap, AlertTriangle, CheckCircle, XCircle } from "lucide-react";
+import { Activity, Brain, Play, RefreshCw, Rss, Users, Clock, Cpu, Zap, AlertTriangle, CheckCircle, XCircle, RotateCcw } from "lucide-react";
 import { api } from "../../api";
 import { Button, Header, Metric } from "../../components/ui";
 
@@ -50,6 +50,22 @@ export function Dashboard() {
       });
   };
 
+  const factoryReset = () => {
+    if (!window.confirm("Perform Factory Reset?\n\nThis will reset telemetry to zero, clear queue, article history, digest state, and restart the scheduler while preserving users, settings, and notification channels.")) {
+      return;
+    }
+    setBusy(true);
+    api("/api/admin/factory-reset", { method: "POST" })
+      .then(() => {
+        setBusy(false);
+        load();
+      })
+      .catch((e) => {
+        setBusy(false);
+        setError(e.message);
+      });
+  };
+
   const ai = d?.ai_status || {};
   const rt = d?.runtime || {};
   const q = d?.queue || {};
@@ -75,6 +91,15 @@ export function Dashboard() {
             </Button>
             <Button icon={Play} onClick={runCycle} disabled={busy}>
               {busy ? "Starting..." : "Run Cycle"}
+            </Button>
+            <Button
+              icon={RotateCcw}
+              variant="secondary"
+              onClick={factoryReset}
+              disabled={busy}
+              style={{ color: "var(--color-error, #ef4444)", borderColor: "rgba(239, 68, 68, 0.3)" }}
+            >
+              Factory Reset
             </Button>
           </>
         }
