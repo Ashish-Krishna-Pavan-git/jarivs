@@ -1,5 +1,15 @@
 # JARVIS Worklog
 
+## 2026-08-02 - Fixed HF_SPACE_URL ImportError in Telegram Module
+
+Primary Issue Resolved: 
+After the Telegram startup redesign, the application crashed with an `ImportError` because `HF_SPACE_URL` was removed from `backend.config.config` but was still being imported by `backend.notifications.bot_listener`.
+
+Key Changes:
+1. **Removed Broken Import**: Removed `HF_SPACE_URL` from the `backend.config.config` import statement in `bot_listener.py`. 
+2. **Global Variable Usage**: `bot_listener.py` already dynamically loads `HF_SPACE_URL = os.getenv("HF_SPACE_URL", "").rstrip("/")` at the module level. The local scope in `start_listener` now implicitly correctly uses the module-level variable without attempting to import it from `config.py`.
+3. **Verification**: Executed `python -m compileall backend` and `pytest tests/test_backend_api.py` to ensure no other cyclic or missing imports exist. All tests pass and the application boots successfully in both Webhook and Polling modes.
+
 ## 2026-08-02 - Telegram Webhook and Startup Architecture Redesign
 
 Primary Issue Resolved: 

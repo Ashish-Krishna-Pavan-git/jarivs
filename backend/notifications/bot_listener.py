@@ -274,7 +274,7 @@ def _set_commands():
 
 
 def start_listener():
-    from backend.config.config import TELEGRAM_TOKEN, TELEGRAM_MODE, HF_SPACE_URL
+    from backend.config.config import TELEGRAM_TOKEN, TELEGRAM_MODE
     if not TELEGRAM_TOKEN:
         return
     
