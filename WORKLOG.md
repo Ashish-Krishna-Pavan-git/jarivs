@@ -15,6 +15,8 @@ Key Changes:
    - Setup Webhook / Admin APIs: connect=10.0s, read=20.0s.
 5. **Diagnostic Endpoint**: Created `GET /api/admin/telegram/timeouts` that dynamically reflects the signature defaults and active policies for debugging in the cloud.
 
+6. **Final Fix for Egress Proxies**: Bypassed Hugging Face space proxies by setting `_session.trust_env = False`. This forces Python to connect directly via IPv4 (honoring our `urllib3` AF_INET monkeypatch), completely avoiding the `HTTP_PROXY` tunnel where the TLS handshake was silently blackholing over IPv6 and throwing the confusing `ReadTimeout(10.0)` from the socket layer.
+
 Verification: All components initialized successfully and tests passed without regressions. Telegram polling accurately obeys the 35s read boundary, and sendMessage avoids duplicate delays.
 
 ## 2026-08-02 - Fixed HF_SPACE_URL ImportError in Telegram Module

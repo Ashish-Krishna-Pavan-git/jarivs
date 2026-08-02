@@ -35,6 +35,7 @@ except Exception:
 
 # Custom session with browser-like user agent and connection pooling
 _session = requests.Session()
+_session.trust_env = False  # Ignore HF Spaces proxy environment variables to force direct IPv4 connection
 _session.headers.update({
     "User-Agent": "JARVIS-Intelligence-Bot/2.0 (+https://huggingface.co/spaces)",
     "Accept": "application/json",
@@ -101,8 +102,13 @@ def telegram_post(
     last_status: int | None = None
 
     for attempt in range(1, max_retries + 1):
+        import threading
+        tid = threading.get_ident()
+        chat_id = payload.get("chat_id") if payload else "N/A"
+        psize = len(json.dumps(payload)) if payload else 0
+        
         t0 = time.time()
-        print(f"[TELEGRAM] [{attempt}/{max_retries}] Starting POST {endpoint} (conn_timeout={connect_timeout}s, read_timeout={read_timeout}s)...")
+        print(f"[TELEGRAM][Thread-{tid}] [{attempt}/{max_retries}] POST {masked_url} | chat_id={chat_id} | payload={psize}B | conn={connect_timeout}s, read={read_timeout}s")
         try:
             if files:
                 resp = _session.post(url, data=payload, files=files, timeout=(connect_timeout, read_timeout))
@@ -114,8 +120,8 @@ def telegram_post(
             snippet = resp.text[:200].replace("\n", " ")
 
             print(
-                f"[TELEGRAM] [{attempt}/{max_retries}] Finished POST {endpoint} "
-                f"-> HTTP {resp.status_code} in {elapsed:.2f}s"
+                f"[TELEGRAM][Thread-{tid}] [{attempt}/{max_retries}] Finished POST {endpoint} "
+                f"-> HTTP {resp.status_code} in {elapsed:.2f}s | Response: {snippet}"
             )
             if resp.status_code != 200:
                 print(f"[TELEGRAM] Failure Response Body: {snippet}")
@@ -203,15 +209,17 @@ def telegram_get(
     masked_url = mask_telegram_token(url)
 
     for attempt in range(1, max_retries + 1):
+        import threading
+        tid = threading.get_ident()
         t0 = time.time()
-        print(f"[TELEGRAM] [{attempt}/{max_retries}] Starting GET {endpoint} (conn_timeout={connect_timeout}s, read_timeout={read_timeout}s)...")
+        print(f"[TELEGRAM][Thread-{tid}] [{attempt}/{max_retries}] GET {masked_url} (conn={connect_timeout}s, read={read_timeout}s)...")
         try:
             resp = _session.get(url, params=params, timeout=(connect_timeout, read_timeout))
             elapsed = time.time() - t0
             snippet = resp.text[:200].replace("\n", " ")
             print(
-                f"[TELEGRAM] [{attempt}/{max_retries}] Finished GET {endpoint} "
-                f"-> HTTP {resp.status_code} in {elapsed:.2f}s"
+                f"[TELEGRAM][Thread-{tid}] [{attempt}/{max_retries}] Finished GET {endpoint} "
+                f"-> HTTP {resp.status_code} in {elapsed:.2f}s | Response: {snippet}"
             )
             if resp.status_code != 200:
                 print(f"[TELEGRAM] Failure Response Body: {snippet}")

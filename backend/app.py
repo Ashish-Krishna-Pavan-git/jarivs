@@ -1028,6 +1028,61 @@ from backend.utils.telegram_client import telegram_post
 from backend.config.config import TELEGRAM_MODE
 
 
+@app.route("/api/admin/network/raw-evidence", methods=["GET"])
+@require_admin
+def admin_network_raw_evidence():
+    """Endpoint executing exact raw socket, curl, and network route evidence collection."""
+    from tools.raw_hf_diagnostics import execute_raw_diagnostics
+    return jsonify(execute_raw_diagnostics())
+
+
+@app.route("/api/admin/network/curl", methods=["POST"])
+@require_admin
+def admin_network_curl():
+    """Diagnostic endpoint to run curl from within the container."""
+    try:
+        data = request.json or {}
+        command = data.get("command")  # "getMe" or "sendMessage"
+        
+        if not TELEGRAM_TOKEN:
+            return jsonify({"error": "Telegram token not configured"}), 400
+            
+        import subprocess
+        
+        if command == "getMe":
+            cmd = ["curl", "-v", f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getMe"]
+        elif command == "sendMessage":
+            chat_id = data.get("chat_id", os.getenv("TELEGRAM_CHAT_ID", ""))
+            text = data.get("text", "HF diagnostic via curl")
+            cmd = [
+                "curl", "-v", "-X", "POST",
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                "-d", f"chat_id={chat_id}",
+                "-d", f"text={text}"
+            ]
+        else:
+            return jsonify({"error": f"Unknown curl command: {command}"}), 400
+            
+        print(f"[CURL] Running: {' '.join(cmd).replace(TELEGRAM_TOKEN, 'bot***')}")
+        
+        t0 = time.time()
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+        elapsed = time.time() - t0
+        
+        output = result.stdout + "\n" + result.stderr
+        output = output.replace(TELEGRAM_TOKEN, "bot***")
+        
+        return jsonify({
+            "elapsed_s": round(elapsed, 2),
+            "returncode": result.returncode,
+            "output": output
+        })
+    except subprocess.TimeoutExpired as exc:
+        return jsonify({"error": "curl command timed out after 45s", "output": str(exc.output).replace(TELEGRAM_TOKEN, "bot***") if exc.output else ""}), 500
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
 @app.route("/api/admin/telegram/timeouts", methods=["GET"])
 @require_admin
 def admin_telegram_timeouts():
