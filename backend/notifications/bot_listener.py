@@ -283,12 +283,11 @@ def _set_commands():
 
 
 def start_listener():
+    if not TELEGRAM_TOKEN:
+        return
     threading.Thread(target=_set_commands, daemon=True).start()
     if HF_SPACE_URL:
         print(f"[BOT] Webhook mode — {HF_SPACE_URL}/telegram/<token>")
     else:
-        if TELEGRAM_TOKEN:
-            ok = _delete_webhook()
-            print(f"[BOT] Pre-poll webhook clear: {'✓' if ok else 'failed (will self-heal on first 409)'}")
         threading.Thread(target=_poll_loop, daemon=True).start()
         print("[BOT] Polling mode started")

@@ -1,6 +1,27 @@
 # JARVIS Worklog
 
-## 2026-08-02 - Dual Telegram & Slack Notification Pipeline Resolution
+## 2026-08-02 - Non-Blocking Telegram Startup & Hugging Face Webhook Resolution
+
+Root Cause of HF Spaces Telegram Startup Hang & Failures:
+1. **Synchronous Pre-Startup Webhook Network Calls**: `register_webhook()` and `delete_webhook()` were called synchronously inside `main()` in `backend/app.py` BEFORE Flask bound port 7860 (`app.run()`).
+2. **Hugging Face Container Startup Race Condition**: Calling Telegram's `setWebhook` API with `https://akp-07-jarvis-agent.hf.space/telegram/<TOKEN>` caused Telegram's servers to attempt an HTTP validation probe to `https://akp-07-jarvis-agent.hf.space`. Because Flask was not yet listening on port 7860 and Hugging Face edge proxies drop incoming webhooks until containers pass health checks, `setWebhook` hung for 25+ seconds, timed out, and triggered synchronous `delete_webhook()` calls.
+3. **Startup Blocking & 409 Conflict Loops**: The synchronous network calls blocked application container initialization for 37+ seconds, and caused `409 Conflict` errors when `getUpdates` long-polling started while a webhook registration attempt was pending on Telegram servers.
+
+Files Created / Changed:
+- `backend/app.py` — Made Telegram initialization completely non-blocking:
+  - `main()` launches Flask (`app.run(host="0.0.0.0", port=7860)`) immediately so HF health checks pass without delay.
+  - Webhook registration (`register_webhook()`), fallback deletion (`delete_webhook()`), and startup messages run asynchronously in a daemon thread after Flask binds port 7860.
+- `backend/notifications/bot_listener.py` — Made `start_listener()` non-blocking:
+  - Removed synchronous `_delete_webhook()` call from `start_listener()`. Polling starts immediately in a daemon thread and self-heals asynchronously if 409 Conflict occurs.
+
+Verification Performed:
+- **Direct API Timings**: `getMe` (0.70s), `sendMessage` (0.42s), `deleteWebhook` (0.26s).
+- **Notifier Pipeline**: `notify_immediate` (True), `send_digest` (True).
+- **Backend Test Suite**: `pytest tests/test_backend_api.py` (8/8 test cases passing, 100% pass rate).
+
+Status: Non-Blocking Non-Hanging Telegram Architecture Verified.
+
+---
 
 Root Cause of Notification Non-Delivery for Critical Alerts & Cycle Reports:
 1. **Strict Keyword Filtering in Alert Processor**: `is_dead_serious()` in `worker_processor.py` required `confidence >= 7` or `confidence >= 8` AND explicit string matching for zero-day keywords. When `is_dead_serious()` returned `False`, articles classified as `CRITICAL` or `HIGH` by the AI were logged as `"queued for 8hr digest"` and `notify_immediate()` was never called.

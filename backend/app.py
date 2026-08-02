@@ -1042,12 +1042,25 @@ def main():
     print("[CLOUD] Starting JARVIS backend...")
     if is_configured():
         pull_state()
-    webhook_ok = register_webhook()
-    if not webhook_ok:
-        delete_webhook()
-        os.environ["HF_SPACE_URL"] = ""
+
     proc = subprocess.Popen([sys.executable, "scheduler.py"], env=os.environ.copy())
     print(f"[CLOUD] Scheduler started (pid={proc.pid})")
+
+    if TELEGRAM_TOKEN:
+        def _async_telegram_init():
+            time.sleep(3)
+            if HF_SPACE_URL:
+                print(f"[CLOUD] Registering Telegram webhook for {HF_SPACE_URL}...")
+                ok = register_webhook()
+                if not ok:
+                    print("[CLOUD] Webhook registration skipped/failed — using polling mode")
+                    delete_webhook()
+            else:
+                delete_webhook()
+            send_startup_message()
+
+        threading.Thread(target=_async_telegram_init, daemon=True).start()
+
     port = int(os.getenv("PORT", 7860))
     app.run(host="0.0.0.0", port=port)
 
