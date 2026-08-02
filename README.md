@@ -18,8 +18,8 @@ JARVIS collects security and technology articles from RSS feeds, analyzes them w
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/your-org/jarvis-agent.git
-cd jarvis-agent
+[git clone https://github.com/your-org/jarvis-agent.git](https://github.com/Ashish-Krishna-Pavan-git/jarivs)
+cd jarvis
 
 # 2. Create your environment file
 cp .env.example .env
@@ -35,7 +35,7 @@ open http://localhost:7860
 
 **Default admin login (first run):**
 - Username: `admin`
-- Password: `admin123!ChangeMe`
+- Password: `admin123!ChangeMe` or `admin`
 
 JARVIS forces a password change after the first login.
 
