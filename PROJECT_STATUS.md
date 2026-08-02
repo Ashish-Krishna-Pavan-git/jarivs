@@ -17,6 +17,7 @@ JARVIS is a fully functional, containerized, multi-channel intelligence aggregat
 - ✅ Implemented low-level non-blocking network diagnostics (`tools/network_diagnostics.py`)
 - ✅ **Redesigned Telegram Startup Architecture**: Completely eradicated automatic webhook setup hooks from the application boot sequence to prevent 409 Webhook Conflicts and IPv6 DNS timeouts on Hugging Face Spaces. Introduced explicit polling/webhook modes and an admin API (`/api/admin/telegram/setup`) for manual configuration.
 - ✅ Fixed startup `ImportError` related to `HF_SPACE_URL` in the Telegram notification module.
+- ✅ **Refactored Telegram Network Policies**: Separated `connect_timeout` and `read_timeout` to fix `ReadTimeout(3.0)` on TLS handshakes in cloud edge proxies. Prevented duplicate alert notifications by catching `ReadTimeout` exceptions dynamically and halting the internal retry loop.
 
 ---
 

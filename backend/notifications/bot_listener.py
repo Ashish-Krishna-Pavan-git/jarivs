@@ -35,7 +35,7 @@ def send_reply(chat_id, text):
             payload = {"chat_id": chat_id, "text": chunk}
             if parse_mode:
                 payload["parse_mode"] = parse_mode
-            res = telegram_post("sendMessage", TELEGRAM_TOKEN, payload=payload, timeout=(3.0, 15.0), max_retries=1)
+            res = telegram_post("sendMessage", TELEGRAM_TOKEN, payload=payload, connect_timeout=10.0, read_timeout=30.0, max_retries=1)
             if res.get("ok"):
                 break
             if not res.get("ok") and parse_mode == "Markdown":
@@ -231,7 +231,7 @@ def _poll_loop():
             params = {"timeout": 15, "allowed_updates": _ALLOWED_UPDATES}
             if offset:
                 params["offset"] = offset
-            r = telegram_get("getUpdates", TELEGRAM_TOKEN, params=params, timeout=(3.0, 25.0), max_retries=1)
+            r = telegram_get("getUpdates", TELEGRAM_TOKEN, params=params, connect_timeout=10.0, read_timeout=35.0, max_retries=1)
 
             if r.get("ok"):
                 consecutive_409 = 0

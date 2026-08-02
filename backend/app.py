@@ -1028,6 +1028,36 @@ from backend.utils.telegram_client import telegram_post
 from backend.config.config import TELEGRAM_MODE
 
 
+@app.route("/api/admin/telegram/timeouts", methods=["GET"])
+@require_admin
+def admin_telegram_timeouts():
+    """Diagnostic endpoint to verify active Telegram timeout configurations."""
+    import inspect
+    from backend.utils.telegram_client import telegram_post, telegram_get
+    
+    post_sig = inspect.signature(telegram_post)
+    get_sig = inspect.signature(telegram_get)
+    
+    return jsonify({
+        "telegram_post_defaults": {
+            "connect_timeout": post_sig.parameters["connect_timeout"].default,
+            "read_timeout": post_sig.parameters["read_timeout"].default,
+            "max_retries": post_sig.parameters["max_retries"].default,
+            "retry_on_read_timeout": post_sig.parameters.get("retry_on_read_timeout").default if "retry_on_read_timeout" in post_sig.parameters else None
+        },
+        "telegram_get_defaults": {
+            "connect_timeout": get_sig.parameters["connect_timeout"].default,
+            "read_timeout": get_sig.parameters["read_timeout"].default,
+            "max_retries": get_sig.parameters["max_retries"].default
+        },
+        "active_policies": {
+            "sendMessage": "connect=10.0s, read=30.0s, max_retries=1/3 (ReadTimeout prevents retry)",
+            "getUpdates": "connect=10.0s, read=35.0s, max_retries=1 (Must exceed 15s poll)",
+            "setup": "connect=10.0s, read=20.0s, max_retries=2"
+        }
+    })
+
+
 @app.route("/api/admin/telegram/setup", methods=["POST"])
 @require_admin
 @require_csrf
@@ -1043,11 +1073,11 @@ def admin_telegram_setup():
         if action == "set_webhook":
             if not HF_SPACE_URL:
                 return jsonify({"error": "HF_SPACE_URL not configured"}), 400
-            res = telegram_post("setWebhook", TELEGRAM_TOKEN, payload={"url": f"{HF_SPACE_URL}/telegram/{TELEGRAM_TOKEN}", "drop_pending_updates": False}, timeout=(3.0, 15.0), max_retries=2)
+            res = telegram_post("setWebhook", TELEGRAM_TOKEN, payload={"url": f"{HF_SPACE_URL}/telegram/{TELEGRAM_TOKEN}", "drop_pending_updates": False}, connect_timeout=10.0, read_timeout=20.0, max_retries=2)
             return jsonify({"status": "ok", "result": res})
             
         elif action == "delete_webhook":
-            res = telegram_post("deleteWebhook", TELEGRAM_TOKEN, payload={"drop_pending_updates": False}, timeout=(3.0, 12.0), max_retries=2)
+            res = telegram_post("deleteWebhook", TELEGRAM_TOKEN, payload={"drop_pending_updates": False}, connect_timeout=10.0, read_timeout=20.0, max_retries=2)
             return jsonify({"status": "ok", "result": res})
             
         elif action == "set_commands":
@@ -1059,7 +1089,7 @@ def admin_telegram_setup():
                     {"command": "quiz", "description": "Daily intelligence quiz"},
                     {"command": "deepdive", "description": "Threat research dossier on any topic"},
                 ]
-            }, timeout=(3.0, 15.0), max_retries=2)
+            }, connect_timeout=10.0, read_timeout=20.0, max_retries=2)
             return jsonify({"status": "ok", "result": res})
             
         else:

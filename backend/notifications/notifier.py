@@ -58,7 +58,7 @@ from backend.utils.telegram_client import telegram_post
 
 
 def _send_one(chat_id, text):
-    res = telegram_post("sendMessage", TELEGRAM_TOKEN, payload={"chat_id": chat_id, "text": text}, timeout=(3.0, 20.0), max_retries=3)
+    res = telegram_post("sendMessage", TELEGRAM_TOKEN, payload={"chat_id": chat_id, "text": text}, connect_timeout=10.0, read_timeout=30.0, max_retries=3)
     if res.get("ok"):
         return True
     _log("ERROR", f"Telegram delivery failed for {chat_id}", chat_id=chat_id, error=str(res.get("error"))[:300])
@@ -338,7 +338,7 @@ def test_channel(kind, target, secret=None):
             return {"ok": False, "error": "TELEGRAM_TOKEN is not configured in .env"}
         if not target:
             return {"ok": False, "error": "Telegram chat ID is required"}
-        res = telegram_post("sendMessage", TELEGRAM_TOKEN, payload={"chat_id": target, "text": "✅ JARVIS test message — your Telegram channel is working."}, timeout=(3.0, 15.0), max_retries=2)
+        res = telegram_post("sendMessage", TELEGRAM_TOKEN, payload={"chat_id": target, "text": "✅ JARVIS test message — your Telegram channel is working."}, connect_timeout=10.0, read_timeout=30.0, max_retries=2)
         if res.get("ok"):
             _log("INFO", "Telegram test message sent", chat_id=target)
             return {"ok": True, "message": "Test message sent successfully"}
@@ -371,7 +371,7 @@ def send_audio(filepath, caption="🎙️ JARVIS Daily Audio Briefing"):
             continue
         try:
             with open(filepath, "rb") as audio:
-                res = telegram_post("sendAudio", TELEGRAM_TOKEN, payload={"chat_id": cid, "caption": caption}, files={"audio": audio}, timeout=(5.0, 60.0), max_retries=3)
+                res = telegram_post("sendAudio", TELEGRAM_TOKEN, payload={"chat_id": cid, "caption": caption}, files={"audio": audio}, connect_timeout=15.0, read_timeout=90.0, max_retries=3)
                 if res.get("ok"):
                     ok = True
         except Exception as e:

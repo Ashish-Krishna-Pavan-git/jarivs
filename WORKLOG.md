@@ -1,5 +1,22 @@
 # JARVIS Worklog
 
+## 2026-08-03 - Telegram Network Timeout Policies and Duplicate Fixes
+
+Primary Issue Resolved: 
+Telegram requests on Hugging Face Spaces were intermittently throwing `requests.exceptions.ReadTimeout (read timeout=3.0)`. This occurred because the `(3.0, 20.0)` tuple was occasionally mapping badly in requests, or 3.0s connect timeout was too aggressive for TLS handshakes through cloud edge proxies. Furthermore, when `ReadTimeout` did occur on `sendMessage`, the retries were causing duplicate notifications to be sent because Telegram actually processed the message despite the delay.
+
+Key Changes:
+1. **Separated Timeout Policies**: Refactored `telegram_client.py` to explicitly require `connect_timeout` (default 10.0s) and `read_timeout` (default 30.0s) separately, instead of relying on a shared timeout tuple. 
+2. **Detailed Exception Logging**: Upgraded the exception handlers to log the exact `connect_timeout` and `read_timeout` alongside the `elapsed` time.
+3. **No-Duplicate Retry Logic**: Added a `retry_on_read_timeout` boolean flag to `telegram_post()` (default `False`). If a `requests.exceptions.ReadTimeout` is raised (meaning the TCP connection succeeded and the request was sent, but the response was delayed), the client intentionally breaks the retry loop to avoid sending duplicate alerts to users.
+4. **Targeted Method Limits**:
+   - `sendMessage`: connect=10.0s, read=30.0s, no retry on read timeout.
+   - `getUpdates` (Polling): connect=10.0s, read=35.0s (to safely exceed Telegram's 15s long-poll).
+   - Setup Webhook / Admin APIs: connect=10.0s, read=20.0s.
+5. **Diagnostic Endpoint**: Created `GET /api/admin/telegram/timeouts` that dynamically reflects the signature defaults and active policies for debugging in the cloud.
+
+Verification: All components initialized successfully and tests passed without regressions. Telegram polling accurately obeys the 35s read boundary, and sendMessage avoids duplicate delays.
+
 ## 2026-08-02 - Fixed HF_SPACE_URL ImportError in Telegram Module
 
 Primary Issue Resolved: 
