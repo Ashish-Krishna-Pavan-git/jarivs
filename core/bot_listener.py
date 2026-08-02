@@ -1,1 +1,6 @@
-from bot_listener import *  # noqa: F401,F403
+import importlib
+_mod = importlib.import_module("backend.notifications.bot_listener")
+def __getattr__(name):
+    return getattr(_mod, name)
+def __dir__():
+    return dir(_mod)

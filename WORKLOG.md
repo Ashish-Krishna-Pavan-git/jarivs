@@ -1,5 +1,315 @@
 # JARVIS Worklog
 
+## 2026-08-02 - WordPress Integration, Documentation Completion & Repository Cleanup
+
+Completed:
+
+- **WordPress Publisher (`backend/reports/newsletter_publisher.py`)** — Full rewrite:
+  - New public entry point: `publish_to_wordpress(ai_summary, all_items)` (returns structured result dict, never raises)
+  - `save_and_publish_newsletter()` kept as backward-compatible alias for `daily_summary.py` callers
+  - Retry-aware HTTP requests with exponential back-off (3 attempts, 3s × attempt)
+  - Duplicate-safe: queries existing post by slug before creating (updates if found, creates if new)
+  - `WP_TAGS` env var support for attaching tag IDs (comma-separated integers)
+  - Structured audit log written to `$JARVIS_DATA_DIR/wordpress_posts.jsonl` (slug, timestamp, post_id, post_url, action, error)
+  - Full HTML builder with `escalating_threats`, `new_patterns`, `actor_activity`, `critical_cves`, `tech_trends`, `recommendations`, and top-10 source articles by severity
+  - Dark-tech CSS (Orbitron + Inter fonts, sky-blue #38bdf8 accent) matching JARVIS aesthetic
+  - Graceful credential validation — logs skip message without crashing when WP env vars absent
+
+- **New Documentation Files** (`docs/`):
+  - `docs/wordpress.md` — Step-by-step WordPress Application Password setup, environment variables, duplicate prevention, audit log reference, troubleshooting (HTTP 401/403/503, Cloudflare, CSS stripping)
+  - `docs/reports.md` — Report types (cycle digests, daily summary, Sunday weekly), dashboard viewing, degraded mode fallback, file layout, scheduler config
+  - `docs/local-development.md` — Prerequisites, setup steps, hot-reload frontend dev, testing commands, troubleshooting (port conflicts, database locked, blank page, missing ffmpeg), VS Code workspace tips
+
+- **Updated Documentation**:
+  - `docs/INTEGRATIONS.md` — Expanded from 20 lines to full guide covering Telegram, Slack, WordPress, HuggingFace, Ollama, and MCP
+  - `docs/README.md` — Updated sitemap with new guides properly categorized (Getting Started, User, Admin, Integration, Technical, Development)
+  - Root `README.md` — Rewritten as comprehensive GitHub-ready README: Quick Start (Docker + local), feature table, directory structure, all environment variables, WordPress setup summary, full docs index
+
+- **Repository Cleanup**:
+  - Removed `runtime_state.json` and `telemetry.json` from git tracking (both gitignored but were committed — contains live runtime data)
+  - Improved `.gitignore` with organized sections, added: `seen.json`, `queue.json`, `digest_state.json`, `wordpress_posts.jsonl`, `venv/`, `*.egg-info/`, `frontend/npm/`
+
+- **Verification**: All 8/8 pytest tests pass (100% pass rate)
+
+---
+
+## 2026-08-02 - Repository Reorganization & Enterprise Folder Structure
+
+Completed:
+
+- **Reorganized Repository into Professional Subpackages (`backend/`, `scripts/`, `docker/`, `data/`, `config/`, `tools/`)**:
+  - Moved scattered root python modules into specialized backend subpackages:
+    - `backend/config/config.py`: Central configuration and environment loader.
+    - `backend/database/jarvis_db.py`: SQLite database control plane and transactional schema migrations.
+    - `backend/auth/security_utils.py`: JWT, CSRF, Fernet encryption, and password hashing.
+    - `backend/collectors/collector.py` & `scraper.py`: RSS collectors and HTML text scrapers.
+    - `backend/ai/ai_router.py`: Multi-tier LLM router, rate slot locks, and provider fallbacks.
+    - `backend/scheduler/scheduler.py` & `queue_manager.py`: IST cycle scheduler and in-memory queue manager.
+    - `backend/notifications/notifier.py`, `slack_notifier.py`, `bot_listener.py`: Telegram & Slack delivery engines.
+    - `backend/reports/daily_summary.py` & `newsletter_publisher.py`: Executive summary and newsletter generators.
+    - `backend/storage/persistence.py`, `dedupe.py`, `legacy_data.py`, `storage_backend.py`: Storage persistence, dedupe fingerprints, and legacy data bridge.
+    - `backend/services/worker_processor.py`, `audio_generator.py`, `mcp_client.py`, `runtime_state.py`, `subscriber_store.py`, `telemetry.py`, `intelligence.py`: Core background services.
+    - `backend/archive/archive_manager.py`: Report archiver.
+    - `backend/utils/internet_monitor.py`: Network reachability monitor.
+  - Created root-level python shims with dynamic `__getattr__` delegation to maintain 100% backward compatibility for all external callers, scripts, and processes.
+  - Created `scripts/start_backend.py` and `tools/health_check.py` diagnostic utilities.
+  - Created `docker/Dockerfile` and `docker/docker-compose.yml`.
+
+- **Added Folder README Files**:
+  - Created folder `README.md` files for every major directory (`backend/api`, `backend/auth`, `backend/collectors`, `backend/ai`, `backend/scheduler`, `backend/notifications`, `backend/reports`, `backend/database`, `backend/storage`, `backend/archive`, `backend/services`, `backend/utils`, `backend/config`, `backend/models`, `scripts`, `docker`, `data`, `config`, `tests`, `tools`).
+
+- **Created & Updated Comprehensive Documentation Suite (`docs/`)**:
+  - Added `docs/backend.md`, `docs/frontend.md`, `docs/docker.md`, `docs/storage.md`, `docs/folder-structure.md`, `docs/developer-guide.md`, `docs/contributing.md`, and updated `docs/README.md` sitemap.
+
+- **Verification**:
+  - `tools/health_check.py` executed successfully.
+  - `npm run build` in `frontend/` succeeded with 0 errors and 0 warnings.
+  - `python -m pytest -v` executed with 8/8 backend test cases passing (`100%` pass rate).
+
+## 2026-08-02 - Documentation Suite, Single Clear-All Maintenance Action, and Project Handoff
+
+Completed:
+
+- **Enhanced Command Center Clear-All Maintenance Action (`backend/app.py` & `Testing.jsx`)**:
+  - Implemented `clear_all_test_data` target in `testing_clear()` API endpoint.
+  - Deletes all non-production test data artifacts: daily & archive reports (`/data/daily`, `/data/archive`), event logs and alert history (`event_logs` table), in-memory queue entries, scraped/processed/raw article JSON files (`/data/processed`, `/data/raw_articles`), dedupe cache (`seen.json`), and audio files (`/data/audio`).
+  - Preserves working configurations, database schema migrations, user accounts, source feed targets, model providers, and notification channel credentials.
+  - Generates detailed post-cleanup verification reporting (`verified_clean`, file counts, and uncleared errors list) and logs action in admin logs as the new baseline entry.
+  - Added a designated **Clear All Test Data** maintenance section card in `Testing.jsx` requiring explicit user confirmation.
+
+- **Created Comprehensive Documentation Suite (`docs/`)**:
+  - Root [`README.md`](file:///C:/Users/Ashish%20Krishna%20Pavan/Desktop/JarvisD/Jarvis-Agent/README.md) — updated quick start, directory structure, data storage paths, and sitemap.
+  - [`frontend/README.md`](file:///C:/Users/Ashish%20Krishna%20Pavan/Desktop/JarvisD/Jarvis-Agent/frontend/README.md) — Vite/React architecture, component tree, and development scripts.
+  - [`backend/README.md`](file:///C:/Users/Ashish%20Krishna%20Pavan/Desktop/JarvisD/Jarvis-Agent/backend/README.md) — Flask control plane, JWT auth, security headers, and execution flow.
+  - [`docs/README.md`](file:///C:/Users/Ashish%20Krishna%20Pavan/Desktop/JarvisD/Jarvis-Agent/docs/README.md) — complete sitemap and index.
+  - [`docs/architecture.md`](file:///C:/Users/Ashish%20Krishna%20Pavan/Desktop/JarvisD/Jarvis-Agent/docs/architecture.md) — architecture diagrams, subsystem descriptions, and pipeline flow.
+  - [`docs/api.md`](file:///C:/Users/Ashish%20Krishna%20Pavan/Desktop/JarvisD/Jarvis-Agent/docs/api.md) — REST API reference for auth, user feed, admin, and testing endpoints.
+  - [`docs/database.md`](file:///C:/Users/Ashish%20Krishna%20Pavan/Desktop/JarvisD/Jarvis-Agent/docs/database.md) — SQLite schema tables, Fernet encryption, and filesystem layout.
+  - [`docs/deployment.md`](file:///C:/Users/Ashish%20Krishna%20Pavan/Desktop/JarvisD/Jarvis-Agent/docs/deployment.md) — Docker Compose configuration and standalone python setup.
+  - [`docs/configuration.md`](file:///C:/Users/Ashish%20Krishna%20Pavan/Desktop/JarvisD/Jarvis-Agent/docs/configuration.md) — Environment variable reference and `.env` duplicate key warnings.
+  - [`docs/troubleshooting.md`](file:///C:/Users/Ashish%20Krishna%20Pavan/Desktop/JarvisD/Jarvis-Agent/docs/troubleshooting.md) — Troubleshooting checklist, error scenarios, and solutions.
+  - [`docs/testing.md`](file:///C:/Users/Ashish%20Krishna%20Pavan/Desktop/JarvisD/Jarvis-Agent/docs/testing.md) — Pytest suite structure and frontend build verification.
+  - [`docs/notifications.md`](file:///C:/Users/Ashish%20Krishna%20Pavan/Desktop/JarvisD/Jarvis-Agent/docs/notifications.md) — Telegram & Slack channel configuration and testing.
+  - [`docs/ai-routing.md`](file:///C:/Users/Ashish%20Krishna%20Pavan/Desktop/JarvisD/Jarvis-Agent/docs/ai-routing.md) — Multi-tier LLM routing, rate slots, and LLM fallbacks.
+  - [`docs/scheduler.md`](file:///C:/Users/Ashish%20Krishna%20Pavan/Desktop/JarvisD/Jarvis-Agent/docs/scheduler.md) — IST schedule alignment and execution pipeline sequence.
+  - [`docs/project-structure.md`](file:///C:/Users/Ashish%20Krishna%20Pavan/Desktop/JarvisD/Jarvis-Agent/docs/project-structure.md) — Full repository layout tree.
+  - [`docs/command-center.md`](file:///C:/Users/Ashish%20Krishna%20Pavan/Desktop/JarvisD/Jarvis-Agent/docs/command-center.md) — Interactive testing dashboard & maintenance cleanup guide.
+
+- **Created Handoff Document (`PROJECT_STATUS.md`)**:
+  - Created [`PROJECT_STATUS.md`](file:///C:/Users/Ashish%20Krishna%20Pavan/Desktop/JarvisD/Jarvis-Agent/PROJECT_STATUS.md) as the handoff document for future development sessions.
+
+- **Verification**:
+  - Added `test_clear_all_test_data_maintenance_action` to `tests/test_backend_api.py`.
+  - Ran `npm run build` — 1595 modules transformed, 0 warnings, 0 errors.
+  - Ran `python -m pytest` — 8/8 backend test cases passing.
+
+## 2026-08-02 - Testing & Command Center, Source Validation, Report Export, and Production Readiness
+
+Completed:
+
+- **Implemented Testing / Command Center page (`frontend/src/pages/admin/Testing.jsx`)**:
+  - Full-featured system diagnostics & control plane page added to Admin navigation (`Shell.jsx`) and application router (`App.jsx`).
+  - Added pipeline pause/resume toggle (`pipeline-toggle`), single-step collection runner, AI analysis runner, notification channel tester, and report generation runner.
+  - Added individual diagnostic testers for AI Model Providers (`test-providers`), Feed Collectors (`test-collectors`), and MCP Servers (`test-mcp`).
+  - Added maintenance tools for selective data clearing (reports, event logs, articles/queue, dedupe cache), scheduler reset, and config reloading.
+  - Added live telemetry views: pipeline phase banner, queue breakdown, current item processed, active AI model & latency, storage sizes, and real-time error log stream.
+
+- **Added Backend Testing API Endpoints (`backend/app.py`)**:
+  - `GET /api/admin/testing/live-state` — returns runtime phase, queue metrics, AI status, storage path sizes, active component counts, and recent error log entries.
+  - `POST /api/admin/testing/pipeline-toggle` — toggles global pipeline execution pause/resume setting.
+  - `POST /api/admin/testing/run-collection` — runs immediate source collection cycle.
+  - `POST /api/admin/testing/run-ai-analysis` — tests multi-tier AI analysis on demand.
+  - `POST /api/admin/testing/run-notification` — tests all configured Telegram and Slack notification channels.
+  - `POST /api/admin/testing/run-report` — generates intelligence report on demand.
+  - `POST /api/admin/testing/test-providers` — tests all enabled AI providers in DB and reports latency and success.
+  - `POST /api/admin/testing/test-collectors` — tests all enabled feed sources in DB for HTTP accessibility and article yield.
+  - `POST /api/admin/testing/test-mcp` — tests MCP server transport connections.
+  - `POST /api/admin/testing/clear` — clears target storage (reports, logs, articles, cache).
+  - `POST /api/admin/testing/reset-scheduler` — resets queue and stuck items.
+  - `POST /api/admin/testing/reload-config` — re-reads environment variables and database config.
+  - `GET /api/user/reports/<report_id>/export` — allows downloading reports directly as Markdown (`.md`) or JSON files.
+
+- **Hardened Source Management (`collector.py`)**:
+  - Added `is_valid_source_url()` helper to validate HTTP/HTTPS schemes before fetching feeds.
+  - Ensured deleted and disabled sources in DB are strictly ignored during collection cycles.
+
+- **Enhanced Reports User UI (`Reports.jsx`)**:
+  - Added "Export Markdown" and "Export JSON" buttons to all report cards for instant downloading.
+
+- **Test Suite Extended (`tests/test_backend_api.py`)**:
+  - Added `test_testing_center_endpoints` covering live state, pipeline toggle, provider testing, collector testing, AI analysis, and scheduler reset.
+  - All unit tests pass cleanly.
+
+- **Build Verification**:
+  - `npm run build` executed under `frontend/` — 1595 modules transformed, 0 warnings, 0 errors.
+
+## 2026-08-02 - End-to-end visibility fixes: AI status, reports, notifications, and .env critical bug
+
+Completed:
+
+- **CRITICAL FIX: `.env` duplicate keys wiped all API credentials.**
+  - Root cause: `TELEGRAM_TOKEN`, `GEMINI_API_KEY`, `GROQ_API_KEY`, `OPENAI_API_KEY`, `TELEGRAM_CHAT_ID`, `WP_URL`, `WP_USER`, `WP_APP_PASSWORD` were declared twice in `.env` — once with real values at the top, and again as empty strings at the bottom. `python-dotenv` uses the LAST occurrence of a duplicate key, so every credential was silently overwritten with an empty string.
+  - This was the root cause of: Telegram notifications not arriving, AI analysis degrading to keyword-only fallback, and Slack delivery having no webhook.
+  - Fix: Removed the duplicate empty declarations at the bottom of `.env`. Verified all keys now load as `SET`.
+
+- **AI analysis visibility added (`ai_router.py`).**
+  - Added `_ai_status` tracking dict with: `last_task`, `last_provider`, `last_model`, `last_latency_ms`, `last_fallback_used`, `last_success`, `last_error`, `last_called_at`, `total_calls`, `total_fallbacks`, `total_failures`.
+  - `_configured_route_call()` and all fallback router functions (`local_call_premium`, `local_call`, `local_call_article`, `local_call_text`) now record every AI call with provider name, model, latency, success/failure, and whether a fallback was used.
+  - `get_ai_status()` returns a snapshot for the UI.
+  - New endpoint: `GET /api/admin/ai-status`.
+  - `GET /api/admin/overview` now includes `ai_status` in its response.
+
+- **Notification delivery logging added (`notifier.py`).**
+  - `_log()` helper writes to `event_logs` so delivery results appear in the Logs page.
+  - `_send_one()` logs permanent errors (400/403) and retry-exhaustion failures with chat ID and error details.
+  - `_send()` logs when Telegram is skipped (no token / no subscribers) and when delivery succeeds.
+  - `send_digest()`, `send_daily_summary()`, `send_weekly_summary()` now log success/failure with article counts.
+  - New `test_channel(kind, target, secret)` function sends a test message to a specific Telegram chat or Slack webhook and returns a result dict with `ok`/`error`/`message`.
+  - New endpoints: `POST /api/admin/notification-channels/test` and `POST /api/user/notification-channels/test`.
+
+- **Scheduler saves digests even when AI fails (`scheduler.py`).**
+  - Root cause: `scheduler.py` only saved digests when `digest_data` was truthy. If AI synthesis failed (empty API keys), no digest was saved, so the Reports page was always empty.
+  - Fix: When AI synthesis returns `None`, a degraded-mode digest is built from processed items (top titles by category, CVEs) and saved with a `_degraded: True` flag. The Reports page now always shows real content after a cycle.
+  - Runtime state now includes `ai_status` for UI visibility.
+
+- **Frontend Dashboard completely rebuilt (`Dashboard.jsx`).**
+  - Phase banner with color-coded status (idle/collecting/processing/digesting/syncing/daily_summary).
+  - Queue progress with pending/processing/done/failed metrics and a progress bar.
+  - AI Analysis Status panel: provider, model, task, latency, success/failure, fallback used, last call time, total calls, total fallbacks, total failures, and last error.
+  - Telemetry panel with cycles, scraped, failed, last cycle time, and severity breakdown badges.
+  - Cycle timing panel: last started, last finished, last daily, next cycle.
+  - Auto-refresh every 5 seconds (toggleable) so background work is visible without manual refresh.
+
+- **Frontend Reports page rebuilt (`Reports.jsx`).**
+  - Loading state, empty state with icon and guidance, and error state.
+  - Day-range selector (7/30/90 days).
+  - Expandable report cards showing: headline, strategic note, risk level, cybersecurity updates, AI updates, tech & business updates, hardware & mobile updates, escalating threats, patterns, actor activity, tech trends, recommendations, doom/bloom, CVEs.
+  - Degraded-mode reports are flagged with a warning banner.
+
+- **Frontend Feed page rebuilt (`Feed.jsx`).**
+  - Loading state, empty state with icon and guidance.
+  - Severity filter dropdown added.
+  - Each feed item shows: severity badge, category, confidence score, title (link), source, timestamp.
+  - Expandable detail view showing: AI analysis summary, CVEs, actors, affected products, tags, scrape status, paywall status.
+  - Color-coded left border by severity.
+
+- **Frontend Channels page rebuilt (`Channels.jsx`).**
+  - Test button for both new (unsaved) and existing channels.
+  - Test results shown inline with success/failure/loading indicators.
+  - Loading state for channel list.
+  - Improved setup guide with Telegram and Slack instructions.
+
+- **Frontend Logs page rebuilt (`Logs.jsx`).**
+  - Auto-refresh toggle (5s interval).
+  - Loading state and empty state.
+  - Color-coded log levels (ERROR=red, WARN=amber, INFO=green).
+  - Details column showing `details_json` content (truncated).
+
+- **Frontend Sources page updated (`Sources.jsx`).**
+  - Loading state added.
+  - Category field changed to a dropdown with valid categories.
+  - Empty state message.
+
+- **Frontend Models page updated (`Models.jsx`).**
+  - Loading state added.
+  - Status column showing Active/Blocked/Disabled with icons.
+  - Empty state message.
+
+- **CSS styles added (`app.css`).**
+  - Phase banner, progress bar, AI status grid, severity badges, empty state, report styles, feed styles, test result indicators, log level colors, spinner animation.
+
+- **Backend API additions (`backend/app.py`).**
+  - `GET /api/admin/ai-status` — returns AI call metadata.
+  - `POST /api/admin/notification-channels/test` — tests a notification channel.
+  - `POST /api/user/notification-channels/test` — tests a user notification channel.
+  - `GET /api/admin/overview` now includes `ai_status`.
+  - Total routes: 39 (was 36).
+
+Verified:
+
+- `python -m pytest -q`: 6 tests passed (20 deprecation warnings, all `datetime.utcnow()`).
+- `npm run build`: frontend rebuilt successfully, `frontend/dist/index.html` and `assets/` present.
+- Backend smoke test: 39 routes registered, new endpoints confirmed (`/api/admin/notification-channels/test`, `/api/admin/ai-status`, `/api/user/notification-channels/test`).
+- `.env` verification: `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID`, `GEMINI_API_KEY`, `GROQ_API_KEY`, `OPENROUTER_API_KEY` all load as `SET` (previously `EMPTY`).
+- Backend started on port 7860: `/health` returns `{"db":true,"frontend":true,"status":"ok"}`, `/ping` returns `pong`, SPA serves `<title>JARVIS</title>`.
+
+Bugs found and fixed:
+
+1. **`.env` duplicate keys** — all API credentials silently wiped by empty re-declarations at the bottom of the file. Root cause of Telegram/Slack failures and AI degradation.
+2. **No AI visibility** — `ai_router.py` had no tracking; UI couldn't show provider/model/status/fallback. Fixed with `_ai_status` tracking and `get_ai_status()`.
+3. **No notification delivery logging** — `notifier.py` only printed to console; failures invisible in Logs page. Fixed with `_log()` helper writing to `event_logs`.
+4. **Digests not saved on AI failure** — `scheduler.py` skipped `save_digest()` when AI returned `None`. Fixed with degraded-mode digest fallback.
+5. **Dashboard showed raw JSON** — replaced with structured panels for phase, queue, AI status, telemetry, and cycle timing.
+6. **No auto-refresh** — Dashboard and Logs now auto-refresh every 5 seconds.
+7. **Feed lacked AI details** — added expandable detail view with summary, CVEs, actors, affected products, tags.
+8. **No channel test button** — added test endpoints and UI test buttons with inline results.
+9. **No loading/empty/error states** — added to all pages (Dashboard, Reports, Feed, Channels, Logs, Sources, Models).
+
+Files modified:
+
+- `.env` — removed duplicate empty key declarations
+- `ai_router.py` — added AI call tracking (`_ai_status`, `_record_ai_call`, `get_ai_status`, `_tracked_call`)
+- `notifier.py` — added `_log()`, delivery logging in `_send_one`/`_send`, `test_channel()` function
+- `scheduler.py` — degraded-mode digest fallback, AI status in runtime state
+- `backend/app.py` — new endpoints (`ai-status`, `notification-channels/test`), `ai_status` in overview
+- `frontend/src/pages/admin/Dashboard.jsx` — complete rebuild with AI status, queue, telemetry, auto-refresh
+- `frontend/src/pages/user/Reports.jsx` — complete rebuild with expandable cards, loading/empty states
+- `frontend/src/pages/user/Feed.jsx` — complete rebuild with AI details, severity filter, expandable items
+- `frontend/src/pages/Channels.jsx` — test buttons, loading state, inline test results
+- `frontend/src/pages/admin/Logs.jsx` — auto-refresh, loading/empty states, color-coded levels, details column
+- `frontend/src/pages/admin/Sources.jsx` — loading state, category dropdown
+- `frontend/src/pages/admin/Models.jsx` — loading state, status column with Active/Blocked/Disabled
+- `frontend/src/styles/app.css` — new styles for all new UI components
+
+Remaining limitations:
+
+- Docker is not installed in this workstation session, so Compose could not be launched here.
+- Live browser smoke test (login, navigate, run cycle) should be completed on a Docker-enabled machine.
+- The `datetime.utcnow()` deprecation warnings are cosmetic and do not affect functionality.
+- Telegram/Slack delivery requires valid chat IDs and webhook URLs configured by the user via the UI.
+
+## 2026-08-02 - Frontend refactored into clean component structure with full stability fixes
+
+Completed:
+
+- **Split the single-file `frontend/src/main.jsx` into a proper component hierarchy**:
+  - `frontend/src/api.js` — centralized API helper with robust JSON/error handling, token/CSRF store, and auth setters.
+  - `frontend/src/App.jsx` — app root with `ErrorBoundary`, hash-based routing, mode switching (`/admin` ↔ `/user`) via `history.pushState` (zero full-page reloads), `popstate`/`hashchange` listeners, theme handling, and auth bootstrap.
+  - `frontend/src/components/` — `Button`, `ui` (Field/Metric/Header/Table), `Auth` (Login/PasswordChange), `Shell` (sidebar navigation).
+  - `frontend/src/pages/admin/` — `Dashboard`, `Sources`, `Models`, `Users`, `Channels` (shared), `Mcp`, `Logs`, plus `JsonPage` for storage/health/migrations read-only views.
+  - `frontend/src/pages/user/` — `Feed`, `Reports`, `Assistant`, `Preferences`, `Channels` (shared user mode).
+  - `frontend/src/main.jsx` — slim entry point rendering `<Root />`.
+
+- **Fixed all runtime error sources**:
+  - `api()` now safely parses non-JSON responses instead of throwing on `JSON.parse`.
+  - All page components catch API errors and render inline error banners instead of crashing.
+  - `Login` and `PasswordChange` now handle failures gracefully and disable submit while busy.
+  - Added a global `ErrorBoundary` with a "Try again" recovery UI so no page can white-screen the app.
+  - MCP test result now renders a readable message instead of `undefined`.
+  - Reports page renders an empty state message instead of a blank list.
+
+- **Navigation is now instant**:
+  - Hash changes update React state immediately (`setRoute`) without waiting for the `hashchange` event.
+  - Admin ↔ User console switching uses `history.pushState` — no full page reload, no Ctrl+R needed.
+  - Browser back/forward buttons are handled via both `popstate` and `hashchange` listeners.
+
+- **Verified**:
+  - `npm.cmd run build` succeeds and regenerates `frontend/dist` with the new component bundle.
+  - `python -m pytest -q` — all 6 backend tests pass.
+  - Backend import smoke test — 36 routes registered, `/`, `/admin`, `/user` each return the SPA `200` with the `dist` bundle, `/health` returns `{"status":"ok","db":true,"frontend":true}`.
+
+Known environment limits:
+
+- Docker is not installed in this workstation session, so Compose could not be launched here.
+- The local Node setup is available in `frontend/node_modules`; production Docker builds install and build it independently.
+- Live-database login could not be re-verified because the local admin password was changed in a prior session (expected behavior — pytest covers the full auth flow against an isolated test database).
+
+Next safe milestones:
+
+1. Run `docker compose up --build` on a Docker-enabled machine and complete the documented browser smoke flow.
+2. Add real browser smoke tests (Playwright) once the project environment includes a browser runner.
+3. Extend report search/export and the visual log time-range filter after the core deployment check passes.
+
 ## 2026-08-02 - Core production flow verified
 
 Completed:

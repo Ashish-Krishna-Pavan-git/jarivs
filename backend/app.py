@@ -21,6 +21,7 @@ load_dotenv(ROOT / ".env", override=False)
 from jarvis_db import (
     DB_PATH,
     change_password,
+    clear_logs,
     create_user,
     delete_source,
     disable_notification_channel,
@@ -254,7 +255,8 @@ def overview():
     from queue_manager import stats as queue_stats
     from runtime_state import load_runtime_state
     from telemetry import get_stats
-    return jsonify({"runtime": load_runtime_state(), "telemetry": get_stats(), "queue": queue_stats(), "sources": len(list_sources()), "models": len(list_model_providers()), "users": len(list_users()), "legacy": _legacy_summary()})
+    from ai_router import get_ai_status
+    return jsonify({"runtime": load_runtime_state(), "telemetry": get_stats(), "queue": queue_stats(), "sources": len(list_sources()), "models": len(list_model_providers()), "users": len(list_users()), "legacy": _legacy_summary(), "ai_status": get_ai_status()})
 
 
 @app.route("/api/admin/system/health")
@@ -369,6 +371,24 @@ def admin_channel_disable(channel_id):
     return jsonify({"ok": True})
 
 
+@app.route("/api/admin/notification-channels/test", methods=["POST"])
+@require_admin
+@require_csrf
+def admin_channel_test():
+    """Test a notification channel (Telegram/Slack) and return a visible result."""
+    from notifier import test_channel
+    data = _json_body()
+    return jsonify(test_channel(str(data.get("kind", "")), str(data.get("target", "")), data.get("secret") or {}))
+
+
+@app.route("/api/admin/ai-status")
+@require_admin
+def ai_status():
+    """Return current AI routing status for UI visibility."""
+    from ai_router import get_ai_status
+    return jsonify(get_ai_status())
+
+
 @app.route("/api/admin/mcp", methods=["GET", "POST"])
 @require_admin
 @require_csrf
@@ -413,10 +433,403 @@ def migrations():
     return jsonify({"legacy": _legacy_summary(), "records": list_migration_records(500), "schema": schema_status()})
 
 
+@app.route("/api/admin/testing/live-state")
+@require_admin
+def testing_live_state():
+    from queue_manager import stats as queue_stats
+    from runtime_state import load_runtime_state
+    from telemetry import get_stats
+    from ai_router import get_ai_status
+    from config import ARCHIVE_DIR, DAILY_DIR, DATA_DIR, PROCESSED_DIR, RAW_DIR
+    
+    paths = {"data": DATA_DIR, "database": DB_PATH, "processed": PROCESSED_DIR, "daily": DAILY_DIR, "archive": ARCHIVE_DIR, "raw_articles": RAW_DIR}
+    storage_sizes = {k: _path_info(Path(v)) for k, v in paths.items()}
+    
+    paused = get_setting("pipeline:paused", "0") == "1"
+    err_logs = list_logs(50)
+    recent_errors = [l for l in err_logs if l.get("level") == "ERROR"][:15]
+    
+    return jsonify({
+        "runtime": load_runtime_state(),
+        "pipeline_paused": paused,
+        "queue": queue_stats(),
+        "ai_status": get_ai_status(),
+        "telemetry": get_stats(),
+        "storage": storage_sizes,
+        "recent_errors": recent_errors,
+        "counts": {
+            "sources": len(list_sources()),
+            "sources_enabled": len([s for s in list_sources() if s.get("enabled")]),
+            "providers": len(list_model_providers()),
+            "providers_enabled": len([p for p in list_model_providers() if p.get("enabled")]),
+            "mcp_servers": len(list_mcp_servers()),
+            "channels": len(list_notification_channels(include_disabled=True)),
+        }
+    })
+
+
+@app.route("/api/admin/testing/pipeline-toggle", methods=["POST"])
+@require_admin
+@require_csrf
+def testing_pipeline_toggle():
+    from runtime_state import update_runtime_state
+    current = get_setting("pipeline:paused", "0") == "1"
+    next_val = "0" if current else "1"
+    set_setting("pipeline:paused", next_val)
+    is_paused = next_val == "1"
+    update_runtime_state(phase="paused" if is_paused else "idle")
+    log_event("INFO", "testing", f"Pipeline {'paused' if is_paused else 'resumed'} by admin")
+    return jsonify({"ok": True, "paused": is_paused})
+
+
+@app.route("/api/admin/testing/run-collection", methods=["POST"])
+@require_admin
+@require_csrf
+def testing_run_collection():
+    from collector import collect_all
+    from dedupe import get_new_articles
+    from queue_manager import add_batch
+    raw = collect_all(limit_per_source=15)
+    new_articles = get_new_articles(raw)
+    if new_articles:
+        add_batch(new_articles)
+    log_event("INFO", "testing", "Manual collection test completed", {"collected": len(raw), "new": len(new_articles)})
+    return jsonify({"ok": True, "collected": len(raw), "new": len(new_articles)})
+
+
+@app.route("/api/admin/testing/run-ai-analysis", methods=["POST"])
+@require_admin
+@require_csrf
+def testing_run_ai_analysis():
+    from ai_router import ai_analyze, get_ai_status
+    data = _json_body()
+    title = str(data.get("title") or "Test Security Vulnerability Advisory")
+    content = str(data.get("content") or "Critical remote code execution vulnerability discovered in widespread open-source library. Active exploitation observed in the wild. CVE-2026-8888.")
+    result = ai_analyze(title, content)
+    return jsonify({"ok": True, "analysis": result, "ai_status": get_ai_status()})
+
+
+@app.route("/api/admin/testing/run-notification", methods=["POST"])
+@require_admin
+@require_csrf
+def testing_run_notification():
+    from notifier import test_channel
+    results = []
+    channels = list_notification_channels(include_disabled=False)
+    if not channels:
+        if TELEGRAM_TOKEN and os.getenv("TELEGRAM_CHAT_ID"):
+            results.append({"kind": "telegram", "target": os.getenv("TELEGRAM_CHAT_ID"), **test_channel("telegram", os.getenv("TELEGRAM_CHAT_ID"))})
+        if os.getenv("SLACK_WEBHOOK_URL"):
+            results.append({"kind": "slack", "target": "SLACK_WEBHOOK_URL", **test_channel("slack", os.getenv("SLACK_WEBHOOK_URL"))})
+    else:
+        for ch in channels:
+            res = test_channel(ch.get("kind"), ch.get("target"), ch.get("secret") or {})
+            results.append({"id": ch.get("id"), "label": ch.get("label"), "kind": ch.get("kind"), "target": ch.get("target"), **res})
+    return jsonify({"ok": True, "results": results})
+
+
+@app.route("/api/admin/testing/run-report", methods=["POST"])
+@require_admin
+@require_csrf
+def testing_run_report():
+    from scheduler import run_cycle
+    threading.Thread(target=run_cycle, args=("Test Run",), kwargs={"boot_cycle": False}, daemon=True).start()
+    return jsonify({"ok": True, "message": "Report generation cycle started in background"})
+
+
+@app.route("/api/admin/testing/test-providers", methods=["POST"])
+@require_admin
+@require_csrf
+def testing_test_providers():
+    providers = list_model_providers()
+    results = []
+    for p in providers:
+        if not p.get("enabled"):
+            results.append({"id": p.get("id"), "name": p.get("name"), "provider_type": p.get("provider_type"), "model": p.get("model"), "ok": False, "skipped": True, "error": "Provider disabled"})
+            continue
+        t0 = time.time()
+        kind = str(p.get("provider_type", "")).lower()
+        pname = p.get("name")
+        pmodel = p.get("model")
+        test_prompt = "Return JSON: {\"status\": \"ok\"}"
+        ok = False
+        err = None
+        try:
+            if kind == "gemini":
+                from ai_router import gemini_call
+                res = gemini_call(test_prompt, retries=1, model=pmodel)
+                ok = bool(res)
+            elif kind == "groq":
+                from ai_router import groq_call
+                res = groq_call(test_prompt, model=pmodel, retries=1)
+                ok = bool(res)
+            elif kind == "ollama":
+                from ai_router import _ollama_call
+                res = _ollama_call(p, test_prompt, json_mode=True)
+                ok = bool(res)
+            elif kind in {"openai", "openai_compatible", "custom"}:
+                from ai_router import _openai_compatible_call
+                res = _openai_compatible_call(p, test_prompt, json_mode=True)
+                ok = bool(res)
+            else:
+                err = f"Unknown provider type: {kind}"
+        except Exception as exc:
+            err = str(exc)
+        latency = round((time.time() - t0) * 1000, 1)
+        results.append({
+            "id": p.get("id"),
+            "name": pname,
+            "provider_type": kind,
+            "model": pmodel,
+            "ok": ok and not err,
+            "latency_ms": latency,
+            "error": err if not ok else None
+        })
+    return jsonify({"ok": True, "providers": results})
+
+
+@app.route("/api/admin/testing/test-collectors", methods=["POST"])
+@require_admin
+@require_csrf
+def testing_test_collectors():
+    import feedparser
+    sources = list_sources()
+    results = []
+    for s in sources:
+        if not s.get("enabled"):
+            results.append({"id": s.get("id"), "name": s.get("name"), "url": s.get("url"), "ok": False, "skipped": True, "error": "Source disabled"})
+            continue
+        t0 = time.time()
+        ok = False
+        count = 0
+        err = None
+        try:
+            feed = feedparser.parse(s["url"])
+            if feed.entries or feed.get("status") in (200, 301, 302):
+                ok = True
+                count = len(feed.entries)
+            else:
+                err = f"Feed parse returned status {feed.get('status', 'unknown')}"
+        except Exception as exc:
+            err = str(exc)
+        latency = round((time.time() - t0) * 1000, 1)
+        results.append({
+            "id": s.get("id"),
+            "name": s.get("name"),
+            "url": s.get("url"),
+            "category": s.get("category"),
+            "ok": ok,
+            "articles_found": count,
+            "latency_ms": latency,
+            "error": err
+        })
+    return jsonify({"ok": True, "sources": results})
+
+
+@app.route("/api/admin/testing/test-mcp", methods=["POST"])
+@require_admin
+@require_csrf
+def testing_test_mcp():
+    from mcp_client import test_mcp_server
+    servers = list_mcp_servers()
+    results = []
+    for s in servers:
+        res = test_mcp_server(s)
+        results.append({"id": s.get("id"), "name": s.get("name"), "transport": s.get("transport"), **res})
+    return jsonify({"ok": True, "servers": results})
+
+
+@app.route("/api/admin/testing/clear", methods=["POST"])
+@require_admin
+@require_csrf
+def testing_clear():
+    data = _json_body()
+    target = str(data.get("target", "")).lower()
+    from config import ARCHIVE_DIR, DAILY_DIR, DATA_DIR, PROCESSED_DIR, RAW_DIR, SEEN_FILE
+    from queue_manager import clear_all as clear_queue_all, stats as queue_stats
+    from dedupe import reset_cache, seen_count
+    from runtime_state import update_runtime_state
+    
+    cleared = []
+    uncleared = []
+
+    if target in ("reports", "all", "clear_all_test_data"):
+        for d in [DAILY_DIR, ARCHIVE_DIR]:
+            p = Path(d)
+            if p.exists():
+                for item in list(p.rglob("*")):
+                    if item.is_file():
+                        try:
+                            item.unlink()
+                        except Exception as exc:
+                            uncleared.append(f"Report file {item.name}: {exc}")
+                for sub in list(p.rglob("*"))[::-1]:
+                    if sub.is_dir():
+                        try:
+                            sub.rmdir()
+                        except Exception:
+                            pass
+        cleared.append("reports")
+
+    if target in ("logs", "alerts", "all", "clear_all_test_data"):
+        try:
+            clear_logs()
+            cleared.append("logs")
+            cleared.append("alerts")
+        except Exception as exc:
+            uncleared.append(f"Event logs table: {exc}")
+
+    if target in ("articles", "all", "clear_all_test_data"):
+        for d in [PROCESSED_DIR, RAW_DIR, Path(DATA_DIR) / "audio"]:
+            p = Path(d)
+            if p.exists():
+                for item in list(p.rglob("*")):
+                    if item.is_file():
+                        try:
+                            item.unlink()
+                        except Exception as exc:
+                            uncleared.append(f"Article/audio file {item.name}: {exc}")
+                for sub in list(p.rglob("*"))[::-1]:
+                    if sub.is_dir():
+                        try:
+                            sub.rmdir()
+                        except Exception:
+                            pass
+        clear_queue_all()
+        cleared.append("articles")
+        cleared.append("queue")
+
+    if target in ("cache", "all", "clear_all_test_data"):
+        p = Path(SEEN_FILE)
+        if p.exists():
+            try:
+                p.unlink()
+            except Exception as exc:
+                uncleared.append(f"Fingerprint cache file: {exc}")
+        reset_cache()
+        cleared.append("cache")
+
+    update_runtime_state(phase="idle", queue_total=0, queue_done=0, queue_failed=0, current_item_title="")
+    log_event("INFO", "testing", f"Maintenance cleanup executed for targets: {', '.join(cleared)}", {"uncleared": uncleared})
+
+    def _count_files(dir_path: str) -> int:
+        p = Path(dir_path)
+        return len([f for f in p.rglob("*") if f.is_file()]) if p.exists() else 0
+
+    verification = {
+        "daily_reports_count": _count_files(DAILY_DIR),
+        "archive_reports_count": _count_files(ARCHIVE_DIR),
+        "processed_articles_count": _count_files(PROCESSED_DIR),
+        "raw_articles_count": _count_files(RAW_DIR),
+        "queue_total": queue_stats().get("total", 0),
+        "dedupe_fingerprints_count": seen_count(),
+        "event_logs_count": len(list_logs(100)),
+        "remaining_uncleared": uncleared,
+    }
+
+    verified_clean = (
+        verification["daily_reports_count"] == 0 and
+        verification["archive_reports_count"] == 0 and
+        verification["processed_articles_count"] == 0 and
+        verification["raw_articles_count"] == 0 and
+        verification["queue_total"] == 0 and
+        verification["dedupe_fingerprints_count"] == 0 and
+        len(uncleared) == 0
+    )
+
+    return jsonify({
+        "ok": True,
+        "cleared": cleared,
+        "verified_clean": verified_clean,
+        "verification": verification,
+    })
+
+
+@app.route("/api/admin/testing/reset-scheduler", methods=["POST"])
+@require_admin
+@require_csrf
+def testing_reset_scheduler():
+    from queue_manager import clear_all, reset_stuck
+    from runtime_state import update_runtime_state
+    reset_stuck()
+    clear_all()
+    update_runtime_state(phase="idle", queue_total=0, queue_done=0, queue_failed=0, current_item_title="")
+    log_event("INFO", "testing", "Scheduler queue and runtime state reset by admin")
+    return jsonify({"ok": True})
+
+
+@app.route("/api/admin/testing/reload-config", methods=["POST"])
+@require_admin
+@require_csrf
+def testing_reload_config():
+    load_dotenv(ROOT / ".env", override=True)
+    init_db()
+    log_event("INFO", "testing", "Configuration and .env reloaded")
+    return jsonify({"ok": True})
+
+
+@app.route("/api/user/reports/<path:report_id>/export")
+@require_user
+def export_report(report_id):
+    from backend.storage.persistence import load_digests as load_runtime_digests
+    from backend.storage.legacy_data import load_digests as load_legacy_digests
+
+    all_reports = load_runtime_digests(90) + load_legacy_digests(90)
+    match = None
+    for r in all_reports:
+        rid = str(r.get("id") or r.get("generated_at") or r.get("report_date") or r.get("_legacy_path") or "")
+        if rid == report_id or report_id in rid:
+            match = r
+            break
+    if not match:
+        return jsonify({"error": "report_not_found"}), 404
+        
+    fmt = request.args.get("format", "markdown").lower()
+    if fmt == "json":
+        res = make_response(json.dumps(match, indent=2))
+        res.headers["Content-Type"] = "application/json"
+        res.headers["Content-Disposition"] = f"attachment; filename=jarvis_report_{report_id[:20]}.json"
+        return res
+        
+    md = [f"# JARVIS Intelligence Report — {match.get('report_date') or match.get('generated_at') or 'Digest'}"]
+    if match.get("headline"):
+        md.append(f"\n## 🎯 {match['headline']}\n")
+    if match.get("strategic_note"):
+        md.append(f"> **Strategic Note:** {match['strategic_note']}\n")
+    for section_key, title in [
+        ("cybersec_updates", "🛡️ Cybersecurity Updates"),
+        ("ai_updates", "🧠 AI Updates"),
+        ("tech_business_updates", "💼 Tech & Business"),
+        ("hardware_mobile_updates", "📱 Hardware & Mobile"),
+        ("escalating_threats", "🔺 Escalating Threats"),
+        ("new_patterns", "🔍 Observed Patterns"),
+        ("actor_activity", "🎭 Threat Actor Activity"),
+        ("recommendations", "✅ Recommended Actions"),
+    ]:
+        items = match.get(section_key, [])
+        if items:
+            md.append(f"### {title}")
+            for item in items:
+                md.append(f"- {item}")
+            md.append("")
+    if match.get("key_cves") or match.get("critical_cves"):
+        cves = match.get("key_cves") or match.get("critical_cves")
+        md.append("### 🔴 Critical Vulnerabilities (CVEs)")
+        for c in cves:
+            md.append(f"- {c}")
+        md.append("")
+        
+    res = make_response("\n".join(md))
+    res.headers["Content-Type"] = "text/markdown; charset=utf-8"
+    res.headers["Content-Disposition"] = f"attachment; filename=jarvis_report_{report_id[:20]}.md"
+    return res
+
+
 @app.route("/api/admin/run/<job>", methods=["POST"])
 @require_admin
 @require_csrf
 def run_job(job):
+
     if job == "daily":
         from scheduler import run_daily
         threading.Thread(target=run_daily, daemon=True).start()
@@ -451,8 +864,8 @@ def user_feed():
 @app.route("/api/user/reports")
 @require_user
 def user_reports():
-    from storage import load_digests as load_runtime_digests
-    from storage.legacy_data import load_digests as load_legacy_digests
+    from backend.storage.persistence import load_digests as load_runtime_digests
+    from backend.storage.legacy_data import load_digests as load_legacy_digests
 
     days = min(max(int(request.args.get("days", 30) or 30), 1), 90)
     reports = load_runtime_digests(days) + load_legacy_digests(days)
@@ -512,6 +925,16 @@ def user_channels():
 def user_channel_disable(channel_id):
     disable_notification_channel(channel_id, user_id=int(g.user["user_id"]))
     return jsonify({"ok": True})
+
+
+@app.route("/api/user/notification-channels/test", methods=["POST"])
+@require_user
+@require_csrf
+def user_channel_test():
+    """Test a user notification channel (Telegram/Slack) and return a visible result."""
+    from notifier import test_channel
+    data = _json_body()
+    return jsonify(test_channel(str(data.get("kind", "")), str(data.get("target", "")), data.get("secret") or {}))
 
 
 @app.route(f"/telegram/<token>", methods=["POST"])

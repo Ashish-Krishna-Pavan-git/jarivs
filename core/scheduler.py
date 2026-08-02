@@ -1,1 +1,6 @@
-from scheduler import *  # noqa: F401,F403
+import importlib
+_mod = importlib.import_module("backend.scheduler.scheduler")
+def __getattr__(name):
+    return getattr(_mod, name)
+def __dir__():
+    return dir(_mod)

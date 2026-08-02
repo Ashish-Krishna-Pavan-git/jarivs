@@ -1,9 +1,45 @@
+# ─── Secrets ──────────────────────────────────────────────────────────────────
 .env
+*.env.local
+
+# ─── Python ───────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
+*$py.class
 .pytest_cache/
-data/
-frontend/node_modules/
-frontend/dist/
+.coverage
+htmlcov/
+*.log
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# ─── Runtime Data & State Files ───────────────────────────────────────────────
+# These are generated at runtime and must never be committed.
+/runtime_state.json
+/telemetry.json
+/seen.json
+seen.json
 *.sqlite
 *.db
+/queue.json
+/digest_state.json
+
+# Data directories (created at runtime)
+/data/*
+!/data/README.md
+
+# WordPress publish audit log (runtime, may contain sensitive URLs)
+wordpress_posts.jsonl
+
+# ─── Frontend ─────────────────────────────────────────────────────────────────
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/npm/
+
+# ─── OS Artifacts ─────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db

@@ -1,0 +1,112 @@
+import { useEffect, useState, useRef } from "react";
+import { RefreshCw, Search, FileText } from "lucide-react";
+import { api } from "../../api";
+import { Button, Header, Table } from "../../components/ui";
+
+const LEVEL_COLORS = {
+  ERROR: "log-error",
+  WARN: "log-warn",
+  INFO: "log-info",
+};
+
+export function Logs() {
+  const [rows, setRows] = useState([]);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [q, setQ] = useState("");
+  const [level, setLevel] = useState("");
+  const [autoRefresh, setAutoRefresh] = useState(false);
+  const timerRef = useRef(null);
+
+  const load = () => {
+    setError("");
+    setLoading(true);
+    api(`/api/admin/logs?limit=500&level=${level}&q=${encodeURIComponent(q)}`)
+      .then((d) => {
+        setRows(d.logs || []);
+        setLoading(false);
+      })
+      .catch((e) => {
+        setError(e.message);
+        setLoading(false);
+      });
+  };
+
+  useEffect(load, []);
+
+  useEffect(() => {
+    if (!autoRefresh) return;
+    timerRef.current = setInterval(load, 5000);
+    return () => clearInterval(timerRef.current);
+  }, [autoRefresh]);
+
+  return (
+    <section>
+      <Header
+        eyebrow="Observability"
+        title="Logs"
+        actions={
+          <Button
+            icon={RefreshCw}
+            variant="secondary"
+            onClick={() => {
+              setAutoRefresh(!autoRefresh);
+              load();
+            }}
+          >
+            {autoRefresh ? "Auto 5s" : "Manual"}
+          </Button>
+        }
+      />
+      {error && <p className="error">{error}</p>}
+      <div className="toolbar">
+        <select value={level} onChange={(e) => setLevel(e.target.value)}>
+          <option value="">All levels</option>
+          <option>INFO</option>
+          <option>WARN</option>
+          <option>ERROR</option>
+        </select>
+        <input placeholder="Search logs" value={q} onChange={(e) => setQ(e.target.value)} />
+        <Button icon={Search} onClick={load}>
+          Filter
+        </Button>
+      </div>
+      {loading ? (
+        <p className="muted">Loading logs...</p>
+      ) : rows.length === 0 ? (
+        <div className="empty-state">
+          <FileText size={48} />
+          <h3>No logs</h3>
+          <p className="muted">System events will appear here as the pipeline runs.</p>
+        </div>
+      ) : (
+        <Table
+          rows={rows}
+          columns={[
+            { label: "Time", key: "created_at" },
+            {
+              label: "Level",
+              render: (r) => <span className={LEVEL_COLORS[r.level] || ""}>{r.level}</span>,
+            },
+            { label: "Component", key: "component" },
+            { label: "Message", key: "message" },
+            {
+              label: "Details",
+              render: (r) => {
+                if (!r.details_json) return "";
+                try {
+                  const d = typeof r.details_json === "string" ? JSON.parse(r.details_json) : r.details_json;
+                  const s = JSON.stringify(d);
+                  return s === "{}" ? "" : <code className="log-details">{s.slice(0, 120)}</code>;
+                } catch {
+                  return "";
+                }
+              },
+            },
+          ]}
+          empty="No log entries"
+        />
+      )}
+    </section>
+  );
+}

@@ -9,5 +9,9 @@ export default defineConfig({
       "/health": "http://localhost:7860"
     }
   },
-  build: { outDir: "dist", emptyOutDir: true }
+  build: {
+    outDir: "dist",
+    emptyOutDir: true,
+    sourcemap: true
+  }
 });

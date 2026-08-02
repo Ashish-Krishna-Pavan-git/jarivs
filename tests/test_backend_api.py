@@ -12,17 +12,44 @@ os.environ["JWT_SECRET"] = "test-jwt-secret-that-is-long-enough"
 os.environ["FLASK_SECRET_KEY"] = "test-flask-secret-that-is-long-enough"
 os.environ["JARVIS_ENCRYPTION_KEY"] = "test-encryption-secret"
 os.environ["JARVIS_DATA_DIR"] = "/tmp/jarvis-test-data"
-os.environ["JARVIS_DB_PATH"] = "/tmp/jarvis-test-data/jarvis.db"
-shutil.rmtree(os.environ["JARVIS_DATA_DIR"], ignore_errors=True)
-
-from backend.app import app  # noqa: E402
-from jarvis_db import DB_PATH  # noqa: E402
-from mcp_client import test_mcp_server as run_mcp_test  # noqa: E402
-from mcp_client import call_mcp  # noqa: E402
-from storage import save_digest  # noqa: E402
-from security_utils import hash_password  # noqa: E402
+import pytest
+from backend.app import app
+from jarvis_db import DB_PATH
+from mcp_client import test_mcp_server as run_mcp_test
+from mcp_client import call_mcp
+from storage import save_digest
+from security_utils import hash_password
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.fixture(autouse=True)
+def setup_clean_db(tmp_path, monkeypatch):
+    db_file = tmp_path / "jarvis.db"
+    data_dir = tmp_path / "data"
+    daily_dir = data_dir / "daily"
+    archive_dir = data_dir / "archive"
+    processed_dir = data_dir / "processed"
+    raw_dir = data_dir / "raw_articles"
+
+    import backend.database.jarvis_db as jarvis_db
+    import backend.app as backend_app
+    import jarvis_db as root_jarvis_db
+    import backend.config.config as backend_config
+    import backend.storage.persistence as backend_persistence
+
+    monkeypatch.setattr(jarvis_db, "DB_PATH", str(db_file))
+    monkeypatch.setattr(backend_app, "DB_PATH", str(db_file))
+    monkeypatch.setattr(root_jarvis_db, "DB_PATH", str(db_file))
+    monkeypatch.setattr(backend_config, "DATA_DIR", str(data_dir))
+    monkeypatch.setattr(backend_config, "DAILY_DIR", str(daily_dir))
+    monkeypatch.setattr(backend_config, "ARCHIVE_DIR", str(archive_dir))
+    monkeypatch.setattr(backend_config, "PROCESSED_DIR", str(processed_dir))
+    monkeypatch.setattr(backend_config, "RAW_DIR", str(raw_dir))
+    monkeypatch.setenv("JARVIS_DB_PATH", str(db_file))
+    monkeypatch.setenv("JARVIS_DATA_DIR", str(data_dir))
+    jarvis_db.init_db()
+    jarvis_db.ensure_admin_user(hash_password)
 
 
 def login(client, password="admin123!ChangeMe"):
@@ -30,6 +57,16 @@ def login(client, password="admin123!ChangeMe"):
     assert res.status_code == 200, res.get_data(as_text=True)
     data = res.get_json()
     return data, {"Authorization": f"Bearer {data['token']}", "X-CSRF-Token": data["csrf"]}
+
+
+def login_as_active_admin(client):
+    data, headers = login(client)
+    if data["user"].get("must_change_password"):
+        changed = client.post("/api/auth/change-password", headers=headers, json={"current_password": "admin123!ChangeMe", "new_password": "ChangedPassword123!"})
+        assert changed.status_code == 200
+        res_data = changed.get_json()
+        headers = {"Authorization": f"Bearer {res_data['token']}", "X-CSRF-Token": res_data["csrf"]}
+    return headers
 
 
 def test_login_forces_password_change_then_allows_admin():
@@ -46,19 +83,20 @@ def test_login_forces_password_change_then_allows_admin():
     save_digest({"headline": "Current runtime digest", "strategic_note": "Available from /data/daily."}, 1)
     reports = client.get("/api/user/reports", headers=headers)
     assert reports.status_code == 200
-    assert any(item.get("headline") == "Current runtime digest" for item in reports.get_json()["reports"])
+    assert any(item.get("headline") == "Current runtime digest" for item in reports.get_json()["reports"]), f"Reports failure: {reports.get_json()}"
 
 
 def test_sources_models_channels_and_encryption():
     client = app.test_client()
-    _, headers = login(client, "ChangedPassword123!")
+    headers = login_as_active_admin(client)
     source = client.post("/api/admin/sources", headers=headers, json={"name": "Example", "url": "https://example.com/feed.xml", "category": "tech", "enabled": True})
     assert source.status_code == 200
     model = client.post("/api/admin/models", headers=headers, json={"name": "custom", "provider_type": "openai_compatible", "model": "model", "base_url": "https://api.openai.com/v1", "api_key_env": "OPENAI_API_KEY", "enabled": True})
     assert model.status_code == 200
     channel = client.post("/api/admin/notification-channels", headers=headers, json={"kind": "slack", "label": "Slack", "target": "https://hooks.slack.com/services/T/B/C", "secret": {"webhook_url": "https://hooks.slack.com/services/T/B/C"}, "enabled": True})
     assert channel.status_code == 200
-    with sqlite3.connect(DB_PATH) as db:
+    import backend.database.jarvis_db as jarvis_db
+    with sqlite3.connect(jarvis_db.DB_PATH) as db:
         secret = db.execute("SELECT secret_json FROM notification_channels WHERE label='Slack'").fetchone()[0]
     assert secret.startswith("fernet:")
     assert "hooks.slack.com" not in secret
@@ -75,8 +113,9 @@ def test_mcp_http_mock():
     response = Mock()
     response.json.return_value = {"jsonrpc": "2.0", "id": 1, "result": {"ready": True}}
     response.raise_for_status.return_value = None
-    with patch("mcp_client.is_safe_external_url", return_value=(True, "")):
-        with patch("mcp_client.requests.post", return_value=response) as post:
+    with patch("backend.services.mcp_client.is_safe_external_url", return_value=(True, "")), \
+         patch("mcp_client.is_safe_external_url", return_value=(True, "")):
+        with patch("backend.services.mcp_client.requests.post", return_value=response) as post:
             result = call_mcp({"transport": "http", "endpoint": "https://mcp.example.com/rpc", "config": {}}, "initialize", {})
     assert result == {"ready": True}
     assert post.call_args.kwargs["json"]["method"] == "initialize"
@@ -84,7 +123,7 @@ def test_mcp_http_mock():
 
 def test_legacy_summary_endpoint_available():
     client = app.test_client()
-    _, headers = login(client, "ChangedPassword123!")
+    headers = login_as_active_admin(client)
     res = client.get("/api/admin/migrations", headers=headers)
     assert res.status_code == 200
     assert "legacy" in res.get_json()
@@ -152,8 +191,12 @@ def test_startup_migrates_legacy_database_and_preserves_auth_data(tmp_path, monk
         assert any(row[2] == "users" and row[3] == "user_id" for row in db.execute("PRAGMA foreign_key_list(notification_channels)"))
         assert any(row[1] == "idx_users_active_username" for row in db.execute("PRAGMA index_list(users)"))
 
-    import jarvis_db
+    import backend.database.jarvis_db as jarvis_db
+    import backend.app as backend_app
+    import jarvis_db as root_jarvis_db
     monkeypatch.setattr(jarvis_db, "DB_PATH", str(legacy_db))
+    monkeypatch.setattr(backend_app, "DB_PATH", str(legacy_db))
+    monkeypatch.setattr(root_jarvis_db, "DB_PATH", str(legacy_db))
     client = app.test_client()
     admin_login = client.post("/api/auth/login", json={"username": "legacy-admin", "password": "LegacyAdminPassword123!"})
     assert admin_login.status_code == 200
@@ -172,3 +215,66 @@ def test_startup_migrates_legacy_database_and_preserves_auth_data(tmp_path, monk
     user_data = user_login.get_json()
     user_headers = {"Authorization": f"Bearer {user_data['token']}", "X-CSRF-Token": user_data["csrf"]}
     assert client.get("/api/admin/overview", headers=user_headers).status_code == 403
+
+
+def test_testing_center_endpoints():
+    client = app.test_client()
+    headers = login_as_active_admin(client)
+    
+    live_state = client.get("/api/admin/testing/live-state", headers=headers)
+    assert live_state.status_code == 200
+    data = live_state.get_json()
+    assert "runtime" in data and "counts" in data
+    
+    toggle = client.post("/api/admin/testing/pipeline-toggle", headers=headers)
+    assert toggle.status_code == 200
+    assert "paused" in toggle.get_json()
+    
+    # Toggle back to unpaused
+    client.post("/api/admin/testing/pipeline-toggle", headers=headers)
+    
+    test_prov = client.post("/api/admin/testing/test-providers", headers=headers)
+    assert test_prov.status_code == 200
+    assert "providers" in test_prov.get_json()
+    
+    test_src = client.post("/api/admin/testing/test-collectors", headers=headers)
+    assert test_src.status_code == 200
+    assert "sources" in test_src.get_json()
+    
+    test_ai = client.post("/api/admin/testing/run-ai-analysis", headers=headers, json={"title": "Test CVE", "content": "Critical RCE zero-day flaw observed."})
+    assert test_ai.status_code == 200
+    assert "analysis" in test_ai.get_json()
+    
+    reset = client.post("/api/admin/testing/reset-scheduler", headers=headers)
+    assert reset.status_code == 200
+
+
+def test_clear_all_test_data_maintenance_action():
+    client = app.test_client()
+    headers = login_as_active_admin(client)
+    
+    # Run a test collection and report generation to populate artifacts
+    client.post("/api/admin/testing/run-ai-analysis", headers=headers, json={"title": "Test Article", "content": "Sample test content."})
+    save_digest({"headline": "Test Digest", "strategic_note": "Test digest note."}, 1)
+    
+    # Execute Clear All Test Data maintenance action
+    res = client.post("/api/admin/testing/clear", headers=headers, json={"target": "clear_all_test_data"})
+    assert res.status_code == 200
+    payload = res.get_json()
+    assert payload["ok"]
+    assert payload["verified_clean"], f"Payload verification failed: {payload}"
+    assert payload["verification"]["daily_reports_count"] == 0
+    assert payload["verification"]["archive_reports_count"] == 0
+    assert payload["verification"]["processed_articles_count"] == 0
+    assert payload["verification"]["queue_total"] == 0
+    assert payload["verification"]["dedupe_fingerprints_count"] == 0
+    # Exactly 1 log should exist (the cleanup log itself)
+    assert payload["verification"]["event_logs_count"] == 1
+    
+    # Verify app and auth still work normally post-cleanup
+    me = client.get("/api/auth/me", headers=headers)
+    assert me.status_code == 200
+    assert me.get_json()["user"]["username"] == "admin"
+
+
+

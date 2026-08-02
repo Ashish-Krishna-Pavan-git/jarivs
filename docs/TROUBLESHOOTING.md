@@ -1,49 +1,65 @@
-# Troubleshooting
+# Troubleshooting & FAQ
 
-## The page does not open
+This guide addresses common error scenarios, diagnostic steps, and resolutions.
 
-Check the container and the health endpoint:
+## Quick Diagnostic Checklist
 
-```bash
-docker compose ps
-curl http://localhost:7860/health
-docker compose logs --tail=150 backend
-```
+1. Check **Command Center / Testing page** (`/admin/#testing`) for provider, collector, or MCP connectivity issues.
+2. Check **Admin → Event Logs** (`/admin/#logs`) filtered by level `ERROR` or `WARN`.
+3. Check system runtime status at `/health` and `/api/admin/system/health`.
 
-`frontend: true` in `/health` means the React production build is being served. Rebuild after frontend changes with `docker compose up --build`.
+---
 
-## I cannot sign in
+## Common Issues & Solutions
 
-On a fresh install with empty `ADMIN_PASSWORD`, use `admin / admin123!ChangeMe`. The default user is created only once, so changing `.env` later does not overwrite an existing administrator. Use the database backup or an existing admin account to recover an established installation.
+### 1. Telegram Notifications Not Arriving / AI Degrading to Keyword Mode
 
-Keep `JWT_SECRET` stable between container restarts. Changing it signs out existing browser sessions.
+**Symptom**:
+Telegram messages fail to send or AI analysis falls back to basic keyword classification.
 
-## Password change is rejected
+**Cause**:
+Duplicate keys in `.env`. If a key is defined at the top with a real value and again at the bottom as `KEY=""`, `python-dotenv` overwrites the real credential with an empty string.
 
-Enter the correct current password and a new password with at least 12 characters. This check applies to the first forced password change as well as later password changes.
+**Fix**:
+Inspect `.env` and remove any duplicate empty re-declarations at the bottom. Ensure keys load as `SET`.
 
-## A manual cycle does not produce feed items
+---
 
-Open Admin -> Logs and Admin -> Health. Common causes are unreachable feeds, missing AI credentials, an unavailable local Ollama server, or provider quota limits. The original scheduler pipeline still writes items under `/data/processed` and reports under `/data/daily`.
+### 2. Reports Page Shows No Reports
 
-## Telegram or Slack does not send
+**Symptom**:
+The User Reports page (`/user/#reports`) is empty.
 
-For Telegram, confirm `TELEGRAM_TOKEN` is set and the bot has received `/start` from the desired chat. A bot can be polled by only one active process. For Slack, confirm the Incoming Webhook URL is correct and the channel is enabled. Inspect Admin -> Logs for notifier errors.
+**Cause**:
+No collection cycle has run yet, or AI synthesis failed without degraded mode fallback.
 
-## MCP test fails
+**Fix**:
+1. Go to Admin → Testing Center (`/admin/#testing`).
+2. Click **Run One Collection Cycle** or **Run Report Generation**.
+3. Verify that digests appear under Reports. (JARVIS saves degraded mode reports if AI synthesis fails so reports are never missing).
 
-HTTP MCP endpoints must accept JSON-RPC over POST. STDIO commands must exist inside the backend container, read one JSON-RPC line from standard input, and return a JSON response line before the configured timeout. Private-network HTTP targets are blocked by default as a security measure.
+---
 
-## Legacy data is not visible
+### 3. Rate Limit Errors (HTTP 429 / Quota Exhausted)
 
-Check that the repository has a `jarvis-data/` folder and that Docker mounted it:
+**Symptom**:
+Log shows `Groq 429 backoff` or `Gemini 429 backoff`.
 
-```bash
-docker compose exec backend ls -la /legacy/jarvis-data
-```
+**Cause**:
+API rate limit thresholds hit on free or shared tier API keys.
 
-JARVIS scans `articles_bundle.json`, dated digest files, telemetry, runtime state, seen IDs, and subscribers. It does not modify any legacy file. See [Migration](MIGRATION.md).
+**Fix**:
+JARVIS automatically handles 429 backoffs with exponential retry logic and temporary provider blocking (`block_model_provider`). Configure secondary model providers (e.g. Groq or Ollama) under **Admin → Models** to allow automatic failover.
 
-## Resetting a local test install
+---
 
-Do not delete a production volume to troubleshoot. For a disposable local test only, stop the stack and remove its named volume, then start again. Back up `/data` and `jarvis-data/` first for any real deployment.
+### 4. Database Schema or Integrity Errors
+
+**Symptom**:
+Error log mentions missing table columns or SQLite integrity error.
+
+**Cause**:
+Outdated database schema version.
+
+**Fix**:
+Restart the backend (`python app.py`). JARVIS automatically runs schema migrations up to version 4 on startup via `jarvis_db.init_db()`.
