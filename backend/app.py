@@ -128,11 +128,29 @@ def require_admin(fn):
     return wrapper
 
 
+import hmac
+
+def _is_secure_request() -> bool:
+    return request.scheme == "https" or request.headers.get("X-Forwarded-Proto") == "https"
+
+
 def require_csrf(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
         if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
-            if request.headers.get("X-CSRF-Token", "") != request.cookies.get("csrf_token", ""):
+            header_csrf = request.headers.get("X-CSRF-Token", "")
+            cookie_csrf = request.cookies.get("csrf_token", "")
+            user_payload = getattr(g, "user", None) or verify_jwt(_token()) or {}
+            jwt_csrf = user_payload.get("csrf", "")
+
+            if not header_csrf:
+                return jsonify({"error": "csrf_failed"}), 403
+
+            if cookie_csrf and hmac.compare_digest(header_csrf, cookie_csrf):
+                pass
+            elif jwt_csrf and hmac.compare_digest(header_csrf, jwt_csrf):
+                pass
+            else:
                 return jsonify({"error": "csrf_failed"}), 403
         return fn(*args, **kwargs)
     return wrapper
@@ -143,12 +161,13 @@ def _safe_user(user: dict[str, Any]) -> dict[str, Any]:
 
 
 def _login_response(user: dict[str, Any]):
-    token = issue_jwt(user["username"], user["role"], int(user["id"]), bool(user.get("must_change_password")))
     csrf = make_csrf_token()
+    token = issue_jwt(user["username"], user["role"], int(user["id"]), bool(user.get("must_change_password")), csrf=csrf)
     res = jsonify({"token": token, "csrf": csrf, "user": _safe_user(user)})
-    secure = request.scheme == "https"
-    res.set_cookie("jarvis_token", token, httponly=True, secure=secure, samesite="Strict", max_age=43200)
-    res.set_cookie("csrf_token", csrf, httponly=False, secure=secure, samesite="Strict", max_age=43200)
+    secure = _is_secure_request()
+    samesite = "None" if secure else "Lax"
+    res.set_cookie("jarvis_token", token, httponly=True, secure=secure, samesite=samesite, max_age=43200)
+    res.set_cookie("csrf_token", csrf, httponly=False, secure=secure, samesite=samesite, max_age=43200)
     return res
 
 
@@ -237,6 +256,14 @@ def login():
         return jsonify({"error": "invalid_credentials"}), 401
     log_event("INFO", "auth", "Login", {"username": user["username"]})
     return _login_response(user)
+
+
+@app.route("/api/auth/logout", methods=["POST"])
+def logout():
+    res = jsonify({"ok": True})
+    res.delete_cookie("jarvis_token")
+    res.delete_cookie("csrf_token")
+    return res
 
 
 @app.route("/api/auth/me")

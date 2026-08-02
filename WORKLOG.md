@@ -1,6 +1,36 @@
 # JARVIS Worklog
 
-## 2026-08-02 - Hugging Face Docker Space Fix & UI Deployment Resolution
+## 2026-08-02 - Authentication & CSRF First-Login Resolution
+
+Root Cause of `csrf_failed` on First Login Password Change:
+1. **Cross-Site Iframe Cookie Restrictions**: When running embedded inside a Hugging Face Space iframe (`https://huggingface.co/spaces/akp-07/jarvis-agent` embedding `https://akp-07-jarvis-agent.hf.space`), browsers treat `huggingface.co` and `hf.space` as cross-site. Cookies set with `SameSite=Strict` are omitted by browsers on iframe requests, causing `request.cookies.get("csrf_token")` to return empty.
+2. **Reverse Proxy Scheme Detection**: Hugging Face's edge proxy terminates SSL and forwards requests over HTTP with `X-Forwarded-Proto: https`. Flask's `request.scheme` evaluates to `"http"`, setting `secure=False`. Browsers reject `SameSite=None` cookies on non-secure responses.
+3. **Fetch API Options**: `frontend/src/api.js` omitted `credentials: "include"`, causing `fetch()` to drop cookies on cross-origin requests.
+
+Files Changed:
+- `backend/auth/security_utils.py` — Updated `issue_jwt` to accept optional `csrf` parameter and include `"csrf": csrf` in the cryptographically signed JWT payload.
+- `backend/app.py` —
+  - Implemented `_is_secure_request()` (checks `request.scheme == "https"` and `X-Forwarded-Proto == "https"`).
+  - Updated `_login_response()` to pass `csrf` to `issue_jwt()` and set `SameSite=None; Secure` when secure / on HF, `SameSite=Lax` on local HTTP.
+  - Updated `require_csrf()` decorator to validate `X-CSRF-Token` header against `request.cookies.get("csrf_token")` OR `g.user.get("csrf")` from verified JWT.
+  - Added `POST /api/auth/logout` endpoint clearing `jarvis_token` and `csrf_token` cookies.
+- `frontend/src/api.js` — Added `credentials: "include"` to `fetch()` options.
+
+Verification Performed:
+- **Frontend Build**: `cd frontend && npm run build` (0 errors, `dist/index.html` and assets built).
+- **Comprehensive Auth & CSRF Test Suite**:
+  - First login with `must_change_password=True` verified.
+  - Protected endpoint access before password change blocked (`password_change_required`, 403).
+  - Password change without `X-CSRF-Token` header blocked (`csrf_failed`, 403).
+  - Password change WITH `X-CSRF-Token` header & JWT claim succeeded (`must_change_password=False`, 200 OK).
+  - Admin endpoint access after password change succeeded (200 OK).
+  - Hugging Face HTTPS proxy detection verified (`SameSite=None; Secure` set-cookie headers).
+  - Logout endpoint verified (`POST /api/auth/logout` 200 OK).
+- **Backend Test Suite**: `pytest tests/test_backend_api.py` (8/8 tests passing, 100% pass rate).
+
+Status: Production-Ready & First-Login Password Change Verified.
+
+---
 
 Root Cause of `akp-07-jarvis-agent.hf.space refused to connect`:
 1. **Missing Hugging Face Spaces YAML Frontmatter**: `README.md` lacked `sdk: docker` and `app_port: 7860` metadata header. Without this, Hugging Face's ingress proxy failed to route port 7860 to `*.hf.space`, causing connection refusal.

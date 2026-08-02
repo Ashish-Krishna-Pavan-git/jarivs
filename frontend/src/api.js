@@ -35,6 +35,7 @@ function buildHeaders(json = true) {
 export async function api(url, options = {}) {
   const hasBody = options.body !== undefined;
   const res = await fetch(url, {
+    credentials: "include",
     ...options,
     headers: { ...buildHeaders(hasBody), ...(options.headers || {}) },
   });

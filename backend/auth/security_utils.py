@@ -85,7 +85,7 @@ def decrypt_json(value: str) -> dict:
         return {}
 
 
-def issue_jwt(username: str, role: str, user_id: int, must_change_password: bool = False) -> str:
+def issue_jwt(username: str, role: str, user_id: int, must_change_password: bool = False, csrf: str | None = None) -> str:
     now = int(time.time())
     header = {"alg": "HS256", "typ": "JWT"}
     payload = {
@@ -98,6 +98,8 @@ def issue_jwt(username: str, role: str, user_id: int, must_change_password: bool
         "exp": now + TOKEN_TTL_SECONDS,
         "jti": secrets.token_urlsafe(12),
     }
+    if csrf:
+        payload["csrf"] = csrf
     body = f"{_b64(json.dumps(header,separators=(',',':')).encode())}.{_b64(json.dumps(payload,separators=(',',':')).encode())}"
     sig = hmac.new(JWT_SECRET.encode(), body.encode("ascii"), hashlib.sha256).digest()
     return f"{body}.{_b64(sig)}"
