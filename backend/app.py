@@ -602,6 +602,14 @@ def admin_notification_diagnostics():
     return jsonify({"ok": True, "diagnostics": get_notification_diagnostics()})
 
 
+@app.route("/api/admin/network/diagnostics", methods=["GET"])
+@require_admin
+def admin_network_diagnostics():
+    from tools.network_diagnostics import run_comprehensive_diagnostics
+    results = run_comprehensive_diagnostics()
+    return jsonify({"ok": True, "diagnostics": results})
+
+
 @app.route("/api/admin/testing/test-providers", methods=["POST"])
 @require_admin
 @require_csrf
