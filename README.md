@@ -14,7 +14,7 @@ Open `http://localhost:7860`.
 Fresh install login:
 
 - Username: `admin`
-- Password: `admin123!ChangeMe`
+- Password: `admin123!ChangeMe` or 'admin'
 
 If `ADMIN_PASSWORD` is empty, JARVIS forces a password change after the first login.
 
