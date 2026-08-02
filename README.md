@@ -6,6 +6,16 @@ emoji: 🏃
 colorFrom: red
 colorTo: indigo
 ---
+title: JARVIS Intelligence System
+emoji: 🤖
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
+>>>>>>> 5036268 (Fix Hugging Face deployment)
 # JARVIS Intelligence System
 
 > Self-hosted AI-powered threat intelligence aggregator, analyst, and publisher.

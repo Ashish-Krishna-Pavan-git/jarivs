@@ -193,13 +193,24 @@ def _path_info(path: Path) -> dict[str, Any]:
 
 
 @app.route("/")
+@app.route("/login")
 @app.route("/user")
+@app.route("/user/<path:_path>")
 @app.route("/admin")
 @app.route("/admin/<path:_path>")
 def spa(_path: str | None = None):
     if FRONTEND_DIST.exists():
         return send_from_directory(FRONTEND_DIST, "index.html")
     return "JARVIS backend online. Build frontend with `cd frontend && npm install && npm run build`."
+
+
+@app.errorhandler(404)
+def handle_404(e):
+    if request.path.startswith("/api/") or request.path.startswith("/assets/"):
+        return jsonify({"error": "Not Found", "path": request.path}), 404
+    if FRONTEND_DIST.exists():
+        return send_from_directory(FRONTEND_DIST, "index.html")
+    return jsonify({"error": "Not Found", "path": request.path}), 404
 
 
 @app.route("/assets/<path:path>")
@@ -988,8 +999,8 @@ def main():
         os.environ["HF_SPACE_URL"] = ""
     proc = subprocess.Popen([sys.executable, "scheduler.py"], env=os.environ.copy())
     print(f"[CLOUD] Scheduler started (pid={proc.pid})")
-    threading.Thread(target=send_startup_message, daemon=True).start()
-    app.run(host="0.0.0.0", port=7860)
+    port = int(os.getenv("PORT", 7860))
+    app.run(host="0.0.0.0", port=port)
 
 
 if __name__ == "__main__":

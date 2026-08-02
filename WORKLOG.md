@@ -1,6 +1,25 @@
 # JARVIS Worklog
 
-## 2026-08-02 - WordPress Integration, Documentation Completion & Repository Cleanup
+## 2026-08-02 - Hugging Face Docker Space Fix & UI Deployment Resolution
+
+Root Cause of `akp-07-jarvis-agent.hf.space refused to connect`:
+1. **Missing Hugging Face Spaces YAML Frontmatter**: `README.md` lacked `sdk: docker` and `app_port: 7860` metadata header. Without this, Hugging Face's ingress proxy failed to route port 7860 to `*.hf.space`, causing connection refusal.
+2. **Browser Iframe Blocking (`X-Frame-Options: DENY`)**: `backend/auth/security_utils.py` enforced `X-Frame-Options: DENY`. Hugging Face embeds Spaces inside an `<iframe>` on `huggingface.co`. Modern browsers block iframe content when `X-Frame-Options: DENY` is returned, resulting in a "refused to connect" browser error.
+3. **Incomplete SPA Catch-All Routes**: `backend/app.py` lacked explicit SPA fallback routes for `/login` and deep paths like `/user/*`, leading to 404 errors on deep navigation or direct page reloads.
+
+Files Changed:
+- `README.md` — Added Hugging Face Spaces YAML frontmatter (`sdk: docker`, `app_port: 7860`, `title`, `emoji`).
+- `backend/auth/security_utils.py` — Replaced `X-Frame-Options: DENY` with `Content-Security-Policy: frame-ancestors 'self' https://huggingface.co https://*.huggingface.co https://*.hf.space;`, updated `Referrer-Policy` to `strict-origin-when-cross-origin`, and updated CORS origin matching to allow Hugging Face domains.
+- `backend/app.py` — Added `@app.route("/login")`, `@app.route("/user/<path:_path>")`, `@app.errorhandler(404)` SPA catch-all handler for non-API routes, and `PORT` env var support (`int(os.getenv("PORT", 7860))`).
+
+Verification Performed:
+- **Frontend Build**: `cd frontend && npm run build` (0 errors, `dist/index.html` and assets generated).
+- **Backend Tests**: `pytest tests/test_backend_api.py` (8/8 tests passing, 100% pass rate).
+- **Security Headers & Routing Verification**: End-to-end Python test script verified `/`, `/login`, `/user/*`, `/admin/*`, `/health`, `/ping`, and CSP `frame-ancestors` headers.
+
+Status: Production-Ready & Hugging Face Spaces Ready.
+
+---
 
 Completed:
 

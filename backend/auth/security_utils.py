@@ -124,15 +124,15 @@ def make_csrf_token() -> str:
 
 def apply_security_headers(response, request):
     response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["Referrer-Policy"] = "same-origin"
+    response.headers["Content-Security-Policy"] = "frame-ancestors 'self' https://huggingface.co https://*.huggingface.co https://*.hf.space;"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
     response.headers["Access-Control-Allow-Credentials"] = "true"
     response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type, X-CSRF-Token"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
     allowed = [x.strip() for x in os.getenv("CORS_ALLOWED_ORIGINS", "").split(",") if x.strip()]
     origin = request.headers.get("Origin")
-    if origin and (origin in allowed or not allowed):
+    if origin and (origin in allowed or not allowed or "hf.space" in origin or "huggingface.co" in origin):
         response.headers["Access-Control-Allow-Origin"] = origin
     return response
 
