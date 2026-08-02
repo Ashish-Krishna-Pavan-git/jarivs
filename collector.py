@@ -12,7 +12,7 @@ import time
 # SOURCES — Curated & verified, no paywalled-only feeds
 # ─────────────────────────────────────────────────────────────
 
-SOURCES = [
+FALLBACK_SOURCES = [
 
     # ── CYBERSECURITY ────────────────────────────────────────
     ("TheHackerNews",     "https://feeds.feedburner.com/TheHackersNews"),
@@ -59,6 +59,18 @@ SOURCES = [
     ("Stratechery",       "https://stratechery.com/feed/"),
 ]
 
+SOURCES = FALLBACK_SOURCES
+
+
+def get_sources():
+    try:
+        from jarvis_db import init_db, list_enabled_sources
+        init_db()
+        return list_enabled_sources() or FALLBACK_SOURCES
+    except Exception as exc:
+        print(f"[COLLECT] DB source load failed; using fallback sources: {exc}")
+        return FALLBACK_SOURCES
+
 
 # ─────────────────────────────────────────────────────────────
 # HELPERS
@@ -82,7 +94,8 @@ def make_id(title, link):
 def collect_all(limit_per_source=40):
     data = []
 
-    for name, url in SOURCES:
+    sources = get_sources()
+    for name, url in sources:
         try:
             feed    = feedparser.parse(url)
             entries = feed.entries[:limit_per_source]
@@ -112,5 +125,5 @@ def collect_all(limit_per_source=40):
         except Exception as e:
             print(f"[WARN] {name} failed: {e}")
 
-    print(f"[COLLECT] Total: {len(data)} articles from {len(SOURCES)} sources")
+    print(f"[COLLECT] Total: {len(data)} articles from {len(sources)} sources")
     return data

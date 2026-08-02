@@ -8,7 +8,7 @@ Model tiers:
   TEXT     chat/deepdive   → gemini-2.5-flash → groq-70b
 """
 
-import json, time, os, random, threading
+import json, time, os, random, threading, requests
 from google import genai
 from google.genai import types
 from groq import Groq
@@ -33,6 +33,77 @@ def _wait(lock, last_ref, interval, name):
         last_ref[0] = time.time()
 
 def dbg(msg): print(f"  [AI] {msg}")
+
+
+def _api_key(provider):
+    env_name = str(provider.get("api_key_env") or "").strip()
+    return os.getenv(env_name, "") if env_name else ""
+
+
+def _ollama_call(provider, prompt, json_mode=True):
+    base_url = str(provider.get("base_url") or os.getenv("OLLAMA_URL", "http://localhost:11434")).rstrip("/")
+    payload = {"model": provider.get("model") or os.getenv("OLLAMA_MODEL", "phi4-mini"), "prompt": prompt, "stream": False}
+    if json_mode:
+        payload["format"] = "json"
+    response = requests.post(f"{base_url}/api/generate", json=payload, timeout=180)
+    response.raise_for_status()
+    return response.json().get("response", "")
+
+
+def _openai_compatible_call(provider, prompt, json_mode=True):
+    base_url = str(provider.get("base_url") or "").rstrip("/")
+    key = _api_key(provider)
+    if not base_url:
+        return None
+    payload = {
+        "model": provider.get("model"),
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.1,
+    }
+    if json_mode:
+        payload["response_format"] = {"type": "json_object"}
+    headers = {"Content-Type": "application/json"}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    response = requests.post(f"{base_url}/chat/completions", json=payload, headers=headers, timeout=180)
+    response.raise_for_status()
+    return response.json()["choices"][0]["message"]["content"]
+
+
+def _configured_route_call(task, prompt, json_mode=True):
+    try:
+        from jarvis_db import block_model_provider, get_model_route, init_db, log_event
+        init_db()
+        route = get_model_route(task)
+    except Exception as exc:
+        dbg(f"DB route unavailable: {exc}")
+        return None
+    for provider in route:
+        kind = str(provider.get("provider_type", "")).lower()
+        try:
+            if float(provider.get("min_interval") or 0) > 0:
+                time.sleep(float(provider.get("min_interval") or 0))
+            if kind == "gemini":
+                result = gemini_call(prompt, model=provider.get("model")) if json_mode else gemini_call_text(prompt, model=provider.get("model"))
+            elif kind == "groq":
+                result = groq_call(prompt, model=provider.get("model")) if json_mode else groq_call_text(prompt, model=provider.get("model"))
+            elif kind == "ollama":
+                result = _ollama_call(provider, prompt, json_mode=json_mode)
+            elif kind in {"openai", "openai_compatible", "custom"}:
+                result = _openai_compatible_call(provider, prompt, json_mode=json_mode)
+            else:
+                continue
+            if result:
+                return result
+        except Exception as exc:
+            msg = str(exc)
+            try:
+                log_event("WARN", "ai_router", f"Provider failed: {provider.get('name')}", {"error": msg[:500]})
+                if any(token in msg.lower() for token in ["429", "quota", "rate", "resource_exhausted"]):
+                    block_model_provider(provider.get("name"), 180, msg[:300])
+            except Exception:
+                pass
+    return None
 
 _SAFETY = [
     types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,       threshold=types.HarmBlockThreshold.BLOCK_NONE),
@@ -306,6 +377,8 @@ def gemini_call_text(prompt, retries=3, model="gemini-2.5-flash"):
 # ─── Routers ──────────────────────────────────────────────────────────────────
 def local_call_premium(prompt):
     """Daily/weekly — gemini-2.5-pro → flash → groq-70b"""
+    r = _configured_route_call("premium", prompt, json_mode=True)
+    if r: return r
     r = gemini_call(prompt, model="gemini-2.5-pro")
     if not r: r = gemini_call(prompt, model="gemini-2.5-flash")
     if not r: r = groq_call(prompt, model="llama-3.3-70b-versatile")
@@ -313,18 +386,24 @@ def local_call_premium(prompt):
 
 def local_call(prompt):
     """Cycle digest / quiz — gemini-2.5-flash → groq-70b"""
+    r = _configured_route_call("digest", prompt, json_mode=True)
+    if r: return r
     r = gemini_call(prompt, model="gemini-2.5-flash")
     if not r: r = groq_call(prompt, model="llama-3.3-70b-versatile")
     return r
 
 def local_call_article(prompt):
     """Per-article bulk — groq-8b → gemini-flash"""
+    r = _configured_route_call("article", prompt, json_mode=True)
+    if r: return r
     r = groq_call(prompt, model="llama-3.1-8b-instant")
     if not r: r = gemini_call(prompt, model="gemini-2.5-flash")
     return r
 
 def local_call_text(prompt):
     """Plain prose — gemini-flash → groq-70b"""
+    r = _configured_route_call("text", prompt, json_mode=False)
+    if r: return r
     r = gemini_call_text(prompt, model="gemini-2.5-flash")
     if not r: r = groq_call_text(prompt, model="llama-3.3-70b-versatile")
     return r

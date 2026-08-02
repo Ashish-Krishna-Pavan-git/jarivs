@@ -1,23 +1,22 @@
-# Use official Python 3.10 image
-FROM python:3.10-slim
+FROM node:22-alpine AS frontend-build
+WORKDIR /app/frontend
+COPY frontend/package.json frontend/vite.config.js frontend/index.html ./
+COPY frontend/src ./src
+RUN npm install && npm run build
 
-# Set the working directory
+FROM python:3.11-slim
 WORKDIR /app
-
-# Install system dependencies (ffmpeg is required for edge-tts audio generation)
-RUN apt-get update && apt-get install -y ffmpeg curl && rm -rf /var/lib/apt/lists/*
-
-# Copy your files into the cloud container
-COPY . /app
-
-# Install Python requirements
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg curl && rm -rf /var/lib/apt/lists/*
+COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
-
-# Create necessary data directories so storage.py doesn't crash
-RUN mkdir -p data/processed data/daily data/archive data/audio
-
-# Expose the Hugging Face web port
+COPY . /app
+COPY --from=frontend-build /app/frontend/dist /app/frontend/dist
+RUN mkdir -p /data/processed /data/daily /data/archive /data/logs /data/raw_articles /legacy
+ENV JARVIS_DATA_DIR=/data \
+    JARVIS_DB_PATH=/data/jarvis.db \
+    JARVIS_LEGACY_DATA_DIR=/legacy/jarvis-data \
+    PYTHONUNBUFFERED=1
 EXPOSE 7860
-
-# Run the app
+VOLUME ["/data"]
+HEALTHCHECK --interval=60s --timeout=10s --retries=3 CMD curl -fsS http://localhost:7860/health || exit 1
 CMD ["python", "app.py"]

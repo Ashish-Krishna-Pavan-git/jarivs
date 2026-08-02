@@ -20,7 +20,15 @@ SEV_EMOJI = {"CRITICAL":"🚨","HIGH":"⚠️","MEDIUM":"📌","LOW":"📄","MIN
 def _get_subs():
     try:
         s = load_subscribers()
-        return list(s) if s else ([str(TELEGRAM_CHAT_ID)] if TELEGRAM_CHAT_ID else [])
+        subs = set(str(item) for item in s)
+        try:
+            from jarvis_db import list_notification_channels
+            for channel in list_notification_channels():
+                if channel.get("kind") == "telegram" and channel.get("enabled") and channel.get("target"):
+                    subs.add(str(channel["target"]))
+        except Exception:
+            pass
+        return list(subs) if subs else ([str(TELEGRAM_CHAT_ID)] if TELEGRAM_CHAT_ID else [])
     except:
         return [str(TELEGRAM_CHAT_ID)] if TELEGRAM_CHAT_ID else []
 
@@ -78,6 +86,21 @@ def _send(text):
 
 def _send_async(text):
     threading.Thread(target=_send, args=(text,), daemon=True).start()
+
+
+def _send_multichannel(text):
+    ok = _send(text)
+    try:
+        from slack_notifier import send_slack_message
+        if send_slack_message(text):
+            ok = True
+    except Exception as exc:
+        print(f"[NOTIFIER] Slack error: {exc}")
+    return ok
+
+
+def _send_multichannel_async(text):
+    threading.Thread(target=_send_multichannel, args=(text,), daemon=True).start()
 
 
 # ─── Cooldown ─────────────────────────────────────────────────────────────────
@@ -253,19 +276,19 @@ def notify_immediate(item):
     if _on_cooldown(item):
         print(f"  [NOTIFIER] Dupe suppressed: {str(item.get('title',''))[:50]}"); return
     print(f"  [NOTIFIER] 🚨 Sending {sev} alert (async)")
-    _send_async(_format_alert(item)); _set_cooldown(item)
+    _send_multichannel_async(_format_alert(item)); _set_cooldown(item)
 
 def send_digest(all_items, cycle_num, ai_digest=None):
     print(f"[NOTIFIER] Sending cycle {cycle_num} digest")
-    _send(_format_digest(all_items, cycle_num, ai_digest))
+    _send_multichannel(_format_digest(all_items, cycle_num, ai_digest))
 
 def send_daily_summary(all_items, ai_summary):
     print("[NOTIFIER] Sending daily report")
-    _send(_format_daily(all_items, ai_summary))
+    _send_multichannel(_format_daily(all_items, ai_summary))
 
 def send_weekly_summary(all_items, ai_summary):
     print("[NOTIFIER] Sending weekly digest")
-    _send(_format_weekly(all_items, ai_summary))
+    _send_multichannel(_format_weekly(all_items, ai_summary))
 
 def telegram_send(text): _send(str(text))
 

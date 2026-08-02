@@ -1,0 +1,14 @@
+{
+  "phase": "processing",
+  "current_cycle_number": 1,
+  "current_cycle_slot": "Boot",
+  "next_cycle_at_ist": "2026-08-02 15:00 IST",
+  "current_item_title": "",
+  "queue_total": 302,
+  "queue_done": 0,
+  "queue_failed": 0,
+  "last_daily_run_ist": null,
+  "last_cycle_started_at": "2026-08-02 10:23 IST",
+  "last_cycle_finished_at": "",
+  "updated_at": "2026-08-02T10:23:37.427649+05:30"
+}

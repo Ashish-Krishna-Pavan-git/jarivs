@@ -8,3 +8,5 @@ flask
 google-genai
 groq
 huggingface_hub>=0.20.0
+cryptography
+pytest

@@ -174,6 +174,39 @@ def load_today_digests() -> list:
     return digests
 
 
+def load_digests(days: int = 30) -> list:
+    """Load current-runtime cycle digests and daily summaries for the Reports view."""
+    cutoff = datetime.utcnow() - timedelta(days=max(1, days))
+    results = []
+    if not os.path.exists(DAILY_DIR):
+        return results
+
+    for day_name in sorted(os.listdir(DAILY_DIR), reverse=True):
+        folder = os.path.join(DAILY_DIR, day_name)
+        if not os.path.isdir(folder):
+            continue
+        try:
+            if datetime.fromisoformat(day_name) < cutoff:
+                continue
+        except ValueError:
+            continue
+        for filename in sorted(os.listdir(folder), reverse=True):
+            is_cycle = filename.startswith("digest_cycle_") and filename.endswith(".json")
+            if filename != "daily_summary.json" and not is_cycle:
+                continue
+            path = os.path.join(folder, filename)
+            try:
+                with open(path, encoding="utf-8") as f:
+                    item = json.load(f)
+                if isinstance(item, dict):
+                    item["_runtime_path"] = path
+                    item.setdefault("report_date", day_name)
+                    results.append(item)
+            except (OSError, json.JSONDecodeError):
+                continue
+    return results
+
+
 def save_daily_report(report_data: dict, report_text: str) -> str:
     day    = datetime.utcnow().strftime("%Y-%m-%d")
     folder = os.path.join(DAILY_DIR, day)

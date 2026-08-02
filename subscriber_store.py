@@ -28,7 +28,15 @@ def load_subscribers() -> set:
         with open(SUBSCRIBERS_FILE, encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, list):
-            return {str(item).strip() for item in data if str(item).strip()}
+            subs = {str(item).strip() for item in data if str(item).strip()}
+            try:
+                from jarvis_db import list_notification_channels
+                for channel in list_notification_channels():
+                    if channel.get("kind") == "telegram" and channel.get("enabled") and channel.get("target"):
+                        subs.add(str(channel["target"]))
+            except Exception:
+                pass
+            return subs
     except Exception:
         pass
 
@@ -56,6 +64,17 @@ def subscribe(chat_id: str) -> set:
     subscribers = load_subscribers()
     subscribers.add(str(chat_id))
     save_subscribers(subscribers)
+    try:
+        from jarvis_db import upsert_notification_channel
+        upsert_notification_channel({
+            "kind": "telegram",
+            "label": f"Telegram {chat_id}",
+            "target": str(chat_id),
+            "secret": {"chat_id": str(chat_id)},
+            "enabled": True,
+        })
+    except Exception:
+        pass
     return subscribers
 
 
@@ -63,4 +82,11 @@ def unsubscribe(chat_id: str) -> set:
     subscribers = load_subscribers()
     subscribers.discard(str(chat_id))
     save_subscribers(subscribers)
+    try:
+        from jarvis_db import disable_notification_channel, list_notification_channels
+        for channel in list_notification_channels(include_disabled=True):
+            if channel.get("kind") == "telegram" and str(channel.get("target")) == str(chat_id):
+                disable_notification_channel(int(channel["id"]))
+    except Exception:
+        pass
     return subscribers
