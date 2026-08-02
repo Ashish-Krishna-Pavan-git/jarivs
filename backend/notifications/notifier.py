@@ -89,14 +89,25 @@ def _send_async(text):
 
 
 def _send_multichannel(text):
-    ok = _send(text)
+    tg_ok = False
+    slack_ok = False
+
+    # 1. Telegram delivery
+    try:
+        tg_ok = _send(text)
+    except Exception as exc:
+        print(f"[NOTIFIER] Telegram error: {exc}")
+        _log("ERROR", f"Telegram error in multichannel send: {exc}")
+
+    # 2. Slack delivery
     try:
         from slack_notifier import send_slack_message
-        if send_slack_message(text):
-            ok = True
+        slack_ok = send_slack_message(text)
     except Exception as exc:
         print(f"[NOTIFIER] Slack error: {exc}")
-    return ok
+        _log("ERROR", f"Slack error in multichannel send: {exc}")
+
+    return tg_ok or slack_ok
 
 
 def _send_multichannel_async(text):
@@ -271,12 +282,18 @@ def _format_weekly(all_items, ai_summary):
 
 # ─── Public API ───────────────────────────────────────────────────────────────
 def notify_immediate(item):
-    sev=item.get("severity","LOW")
-    if sev not in ("CRITICAL","HIGH"): return
+    sev = item.get("severity", "LOW")
+    if sev not in ("CRITICAL", "HIGH"):
+        return False
     if _on_cooldown(item):
-        print(f"  [NOTIFIER] Dupe suppressed: {str(item.get('title',''))[:50]}"); return
-    print(f"  [NOTIFIER] 🚨 Sending {sev} alert (async)")
-    _send_multichannel_async(_format_alert(item)); _set_cooldown(item)
+        print(f"  [NOTIFIER] Dupe suppressed: {str(item.get('title',''))[:50]}")
+        _log("INFO", f"Immediate alert suppressed (cooldown)", title=str(item.get('title',''))[:100], severity=sev)
+        return False
+    print(f"  [NOTIFIER] 🚨 Sending {sev} alert")
+    _log("INFO", f"Triggering immediate {sev} alert", title=str(item.get('title',''))[:100], severity=sev)
+    ok = _send_multichannel(_format_alert(item))
+    _set_cooldown(item)
+    return ok
 
 def send_digest(all_items, cycle_num, ai_digest=None):
     print(f"[NOTIFIER] Sending cycle {cycle_num} digest")

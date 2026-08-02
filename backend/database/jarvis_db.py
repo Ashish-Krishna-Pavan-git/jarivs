@@ -467,6 +467,45 @@ def clear_logs() -> None:
         db.execute("DELETE FROM event_logs")
 
 
+def get_notification_diagnostics() -> dict[str, Any]:
+    with _connect() as db:
+        logs = _rows(db.execute(
+            "SELECT * FROM event_logs WHERE component IN ('notifier', 'telegram', 'slack', 'telegram_client') ORDER BY id DESC LIMIT 100"
+        ))
+
+    tg_logs = [l for l in logs if l.get("component") in ("telegram", "telegram_client") or "Telegram" in str(l.get("message", ""))]
+    slack_logs = [l for l in logs if l.get("component") == "slack" or "Slack" in str(l.get("message", ""))]
+
+    tg_last_ok = next((l for l in tg_logs if l.get("level") == "INFO"), None)
+    tg_last_err = next((l for l in tg_logs if l.get("level") in ("WARN", "ERROR")), None)
+
+    slack_last_ok = next((l for l in slack_logs if l.get("level") == "INFO"), None)
+    slack_last_err = next((l for l in slack_logs if l.get("level") in ("WARN", "ERROR")), None)
+
+    crit_alerts = len([l for l in logs if "immediate" in str(l.get("message", "")).lower() or "critical" in str(l.get("message", "")).lower()])
+    cycle_digests = len([l for l in logs if "digest" in str(l.get("message", "")).lower()])
+    daily_summaries = len([l for l in logs if "daily" in str(l.get("message", "")).lower()])
+
+    return {
+        "telegram": {
+            "last_success": tg_last_ok.get("created_at") if tg_last_ok else None,
+            "last_error": tg_last_err.get("created_at") if tg_last_err else None,
+            "last_error_message": tg_last_err.get("message") if tg_last_err else None,
+        },
+        "slack": {
+            "last_success": slack_last_ok.get("created_at") if slack_last_ok else None,
+            "last_error": slack_last_err.get("created_at") if slack_last_err else None,
+            "last_error_message": slack_last_err.get("message") if slack_last_err else None,
+        },
+        "metrics": {
+            "critical_alerts": crit_alerts,
+            "cycle_digests": cycle_digests,
+            "daily_summaries": daily_summaries,
+        },
+        "recent_logs": logs[:10],
+    }
+
+
 def list_enabled_sources() -> list[tuple[str, str]]:
     with _connect() as db:
         rows = db.execute("SELECT name,url FROM sources WHERE enabled=1 ORDER BY name").fetchall()

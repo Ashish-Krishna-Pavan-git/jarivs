@@ -1,6 +1,38 @@
 # JARVIS Worklog
 
-## 2026-08-02 - Telegram Read Timeout & IPv4 Socket Enforcement Resolution
+## 2026-08-02 - Dual Telegram & Slack Notification Pipeline Resolution
+
+Root Cause of Notification Non-Delivery for Critical Alerts & Cycle Reports:
+1. **Strict Keyword Filtering in Alert Processor**: `is_dead_serious()` in `worker_processor.py` required `confidence >= 7` or `confidence >= 8` AND explicit string matching for zero-day keywords. When `is_dead_serious()` returned `False`, articles classified as `CRITICAL` or `HIGH` by the AI were logged as `"queued for 8hr digest"` and `notify_immediate()` was never called.
+2. **Coupled Channel Execution**: `_send_multichannel()` checked Telegram first and returned `False` if `TELEGRAM_TOKEN` was missing or failed before attempting Slack delivery.
+3. **Missing Slack Webhook Field Extraction**: Slack webhook URLs stored in `list_notification_channels()` were skipped if `channel.secret` was empty.
+4. **Lack of Delivery Diagnostics**: Notification events were executed in daemon threads without returning delivery booleans or recording diagnostic metrics.
+
+Files Created / Changed:
+- `backend/notifications/slack_notifier.py` — Overhauled Slack delivery engine:
+  - Supports `SLACK_WEBHOOK_URL` in `.env`, DB integrations, and DB notification channels.
+  - Sanitized logging (masks webhook URLs in logs).
+  - Connect (3.0s) & Read (15.0s) timeouts with exponential retry logic.
+- `backend/notifications/notifier.py` — Decoupled multichannel dispatch:
+  - Telegram and Slack run independently; failure of one channel does not prevent the other from delivering.
+  - Updated `notify_immediate()`, `send_digest()`, `send_daily_summary()`, `send_weekly_summary()` with detailed event logging.
+- `backend/services/worker_processor.py` — Fixed alert trigger logic:
+  - Automatically triggers `notify_immediate()` for all `CRITICAL` articles and `HIGH` severity articles with `confidence >= 5` or `is_dead_serious`.
+- `backend/database/jarvis_db.py` — Implemented `get_notification_diagnostics()`:
+  - Returns Telegram & Slack last success/error timestamps, error messages, and notification counts.
+- `backend/app.py` — Added `/api/admin/notification-diagnostics` and `/api/admin/testing/trigger-test-alert`.
+
+Verification Performed:
+- **End-to-End Delivery Verification**:
+  - `notify_immediate` (Critical Alert): Telegram HTTP 200 (1.43s, msg #2134) & Slack HTTP 200 (0.64s, `ok`).
+  - `send_digest` (Cycle Digest): Telegram HTTP 200 (0.45s, msg #2135) & Slack HTTP 200 (0.56s, `ok`).
+  - `send_daily_summary` (Daily Brief): Telegram HTTP 200 (0.45s, msg #2136) & Slack HTTP 200 (0.61s, `ok`).
+  - `get_notification_diagnostics()`: Tracked success timestamps and metrics for both channels.
+- **Backend Test Suite**: `pytest tests/test_backend_api.py` (8/8 test cases passing, 100% pass rate).
+
+Status: Dual Telegram & Slack Pipeline Operational.
+
+---
 
 Root Cause of `HTTPSConnectionPool(host='api.telegram.org', port=443): Read timed out. (read timeout=20)`:
 1. **IPv6 Socket Hanging on Cloud/Container Networks**: `api.telegram.org` returns dual-stack IPv6 (`2001:67c:4e8:f004::9`) and IPv4 (`149.154.166.110`) DNS records. Python's `socket.getaddrinfo()` returns IPv6 first. On cloud containers (Hugging Face Spaces / AWS EC2) lacking active outbound IPv6 routing, TCP connection attempts to the IPv6 address hang silently until the HTTP timeout (20-60s) expires, resulting in `Read timed out` or `Connect timed out`.

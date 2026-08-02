@@ -575,6 +575,33 @@ def testing_run_report():
     return jsonify({"ok": True, "message": "Report generation cycle started in background"})
 
 
+@app.route("/api/admin/testing/trigger-test-alert", methods=["POST"])
+@require_admin
+@require_csrf
+def testing_trigger_test_alert():
+    from notifier import notify_immediate
+    test_item = {
+        "title": "🚨 TEST CRITICAL THREAT: Zero-Day Vulnerability Simulation",
+        "link": "https://example.com/cve-2026-99999",
+        "source": "JARVIS Diagnostics",
+        "severity": "CRITICAL",
+        "category": "cybersec",
+        "cves": ["CVE-2026-99999"],
+        "actors": ["APT-TEST"],
+        "summary": ["This is a simulated critical threat alert generated from Command Center to verify Telegram and Slack end-to-end notification delivery."],
+        "confidence": 9,
+    }
+    delivered = notify_immediate(test_item)
+    return jsonify({"ok": True, "delivered": delivered, "message": "Test critical alert processed by notification pipeline"})
+
+
+@app.route("/api/admin/notification-diagnostics", methods=["GET"])
+@require_admin
+def admin_notification_diagnostics():
+    from jarvis_db import get_notification_diagnostics
+    return jsonify({"ok": True, "diagnostics": get_notification_diagnostics()})
+
+
 @app.route("/api/admin/testing/test-providers", methods=["POST"])
 @require_admin
 @require_csrf

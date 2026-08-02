@@ -139,11 +139,18 @@ def process_item(item: dict) -> dict:
     save_article(processed)
     tele_update("processed", severity=severity)
 
-    if is_dead_serious(processed):
-        print(f"  [PROC] 🚨 DEAD SERIOUS — sending immediate alert")
+    should_alert = False
+    if severity == "CRITICAL":
+        should_alert = True
+    elif severity == "HIGH":
+        if is_dead_serious(processed) or confidence >= 5:
+            should_alert = True
+
+    if should_alert:
+        print(f"  [PROC] 🚨 {severity} ALERT — triggering immediate notification")
         notify_immediate(processed)
-    elif severity in IMMEDIATE_ALERT_LEVELS:
-        print(f"  [PROC] {severity} — queued for 8hr digest")
+    else:
+        print(f"  [PROC] {severity} — queued for cycle digest")
     return processed
 
 
