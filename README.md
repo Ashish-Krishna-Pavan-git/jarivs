@@ -1,3 +1,11 @@
+---
+license: mit
+title: Jarvis
+sdk: docker
+emoji: 🏃
+colorFrom: red
+colorTo: indigo
+---
 # JARVIS Intelligence System
 
 > Self-hosted AI-powered threat intelligence aggregator, analyst, and publisher.
