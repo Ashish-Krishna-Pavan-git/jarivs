@@ -1,5 +1,19 @@
 # JARVIS Worklog
 
+## 2026-08-03 - Migration to Slack Upload V2 API
+
+Primary Goal:
+Eliminate the deprecated `files.upload` endpoint (which returns `Slack API error: method_deprecated`) and migrate to Slack Upload V2 using the modern 3-step REST upload workflow.
+
+Key Changes:
+1. **Removed Deprecated Endpoint**: Replaced `https://slack.com/api/files.upload` in `backend/notifications/slack_notifier.py`.
+2. **Implemented Slack Upload V2**:
+   - **Step 1 (`files.getUploadURLExternal`)**: Requests an external upload URL and `file_id` using `filename` and `length` (file size in bytes).
+   - **Step 2 (Binary Upload)**: Posts the file binary bytes directly to the returned `upload_url`.
+   - **Step 3 (`files.completeUploadExternal`)**: Completes the upload transaction and shares the file to `channel_id` with `initial_comment` and `title`.
+3. **Preserved Features**: Preserved exponential backoff retry logic, progress logging, and graceful degradation for Webhook-only deployments.
+4. **Verification**: Verified using mock requests that Step 1, Step 2, and Step 3 execute sequentially and complete cleanly.
+
 ## 2026-08-03 - Live Config Reload, True Factory Reset & Slack Component Fix
 
 Primary Goal:

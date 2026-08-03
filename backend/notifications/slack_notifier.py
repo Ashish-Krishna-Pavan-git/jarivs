@@ -170,51 +170,118 @@ def send_slack_audio(filepath: str, caption: str = "🎙️ Today's Intelligence
             "message": "Slack is not configured with a Bot Token or Webhook URL."
         }
 
-    # 2. Upload file using Slack Bot Token (files.upload API)
-    headers = {"Authorization": f"Bearer {bot_token}"}
+    # 2. Upload file using Slack Bot Token (Slack Upload V2 API: getUploadURLExternal -> POST upload_url -> completeUploadExternal)
+    headers_auth = {"Authorization": f"Bearer {bot_token}"}
+    file_size_bytes = os.path.getsize(filepath)
     last_error = None
 
     for attempt in range(1, max_retries + 1):
         t0 = time.time()
-        print(f"[SLACK] [{attempt}/{max_retries}] Uploading {filename} ({file_size_mb} MB) to Slack channel {channel_id}...")
+        print(f"[SLACK] [{attempt}/{max_retries}] Starting Slack Upload V2 for {filename} ({file_size_mb} MB) to channel {channel_id}...")
         try:
-            with open(filepath, "rb") as file_data:
-                payload = {
-                    "channels": channel_id,
-                    "initial_comment": caption,
-                    "title": f"JARVIS Podcast - {filename}",
-                }
-                files = {"file": (filename, file_data, "audio/mpeg")}
-                resp = requests.post(
-                    "https://slack.com/api/files.upload",
-                    headers=headers,
-                    data=payload,
-                    files=files,
-                    timeout=(10.0, 90.0)
+            # Step 1: Request upload URL from Slack API
+            step1_resp = requests.post(
+                "https://slack.com/api/files.getUploadURLExternal",
+                headers=headers_auth,
+                data={
+                    "filename": filename,
+                    "length": file_size_bytes,
+                },
+                timeout=(10.0, 30.0)
+            )
+            
+            if step1_resp.status_code != 200:
+                last_error = f"Step 1 HTTP {step1_resp.status_code}: {step1_resp.text[:200]}"
+                print(f"[SLACK] ✗ Attempt {attempt} Step 1 failed: {last_error}")
+                _log("WARN", f"Slack Upload V2 Step 1 HTTP {step1_resp.status_code}", error=last_error)
+                if attempt < max_retries:
+                    time.sleep(attempt * 2)
+                continue
+
+            step1_json = step1_resp.json()
+            if not step1_json.get("ok"):
+                err_detail = step1_json.get("error", "getUploadURLExternal failed")
+                last_error = f"Slack API error (Step 1): {err_detail}"
+                print(f"[SLACK] ✗ Attempt {attempt} Step 1 API error: {err_detail}")
+                _log("WARN", f"Slack Upload V2 Step 1 API error", error=err_detail)
+                if attempt < max_retries:
+                    time.sleep(attempt * 2)
+                continue
+
+            upload_url = step1_json.get("upload_url")
+            file_id = step1_json.get("file_id")
+
+            if not (upload_url and file_id):
+                last_error = "Step 1 returned missing upload_url or file_id"
+                print(f"[SLACK] ✗ Attempt {attempt} Step 1 payload error")
+                if attempt < max_retries:
+                    time.sleep(attempt * 2)
+                continue
+
+            # Step 2: Upload file binary to upload_url
+            print(f"[SLACK] [{attempt}/{max_retries}] Uploading {file_size_mb} MB binary to Slack external storage...")
+            with open(filepath, "rb") as file_bytes:
+                step2_resp = requests.post(
+                    upload_url,
+                    data=file_bytes.read(),
+                    timeout=(15.0, 120.0)
                 )
+
+            if step2_resp.status_code not in (200, 201):
+                last_error = f"Step 2 binary upload failed (HTTP {step2_resp.status_code})"
+                print(f"[SLACK] ✗ Attempt {attempt} Step 2 failed: {last_error}")
+                _log("WARN", f"Slack Upload V2 Step 2 HTTP {step2_resp.status_code}", error=last_error)
+                if attempt < max_retries:
+                    time.sleep(attempt * 2)
+                continue
+
+            # Step 3: Complete upload and share to Slack channel
+            print(f"[SLACK] [{attempt}/{max_retries}] Completing Slack upload for file {file_id}...")
+            complete_payload = {
+                "files": [
+                    {
+                        "id": file_id,
+                        "title": f"JARVIS Podcast - {filename}",
+                    }
+                ],
+                "channel_id": channel_id,
+                "initial_comment": caption,
+            }
+            
+            step3_resp = requests.post(
+                "https://slack.com/api/files.completeUploadExternal",
+                headers={
+                    "Authorization": f"Bearer {bot_token}",
+                    "Content-Type": "application/json; charset=utf-8",
+                },
+                json=complete_payload,
+                timeout=(10.0, 30.0)
+            )
+
             elapsed = time.time() - t0
-            if resp.status_code == 200:
-                res_json = resp.json()
-                if res_json.get("ok"):
-                    print(f"[SLACK] ✓ Audio podcast {filename} uploaded to channel {channel_id} in {elapsed:.2f}s")
-                    _log("INFO", f"Slack audio upload succeeded ({elapsed:.2f}s)", channel=channel_id, filename=filename)
-                    return {"ok": True, "message": f"Audio podcast uploaded successfully to Slack channel {channel_id}"}
+            if step3_resp.status_code == 200:
+                step3_json = step3_resp.json()
+                if step3_json.get("ok"):
+                    print(f"[SLACK] ✓ Audio podcast {filename} uploaded via Upload V2 to channel {channel_id} in {elapsed:.2f}s")
+                    _log("INFO", f"Slack audio Upload V2 succeeded ({elapsed:.2f}s)", channel=channel_id, filename=filename, file_id=file_id)
+                    return {"ok": True, "message": f"Audio podcast uploaded successfully via Slack Upload V2 to channel {channel_id}"}
                 else:
-                    err_detail = res_json.get("error", "Unknown Slack API error")
-                    last_error = f"Slack API error: {err_detail}"
-                    print(f"[SLACK] ✗ Attempt {attempt} API error: {err_detail}")
-                    _log("WARN", f"Slack audio API error attempt {attempt}", error=err_detail)
+                    err_detail = step3_json.get("error", "completeUploadExternal failed")
+                    last_error = f"Slack API error (Step 3): {err_detail}"
+                    print(f"[SLACK] ✗ Attempt {attempt} Step 3 API error: {err_detail}")
+                    _log("WARN", f"Slack Upload V2 Step 3 API error", error=err_detail)
             else:
-                last_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
-                print(f"[SLACK] ✗ Attempt {attempt} HTTP {resp.status_code}")
-                _log("WARN", f"Slack audio HTTP {resp.status_code}", status=resp.status_code)
+                last_error = f"Step 3 HTTP {step3_resp.status_code}: {step3_resp.text[:200]}"
+                print(f"[SLACK] ✗ Attempt {attempt} Step 3 HTTP {step3_resp.status_code}")
+                _log("WARN", f"Slack Upload V2 Step 3 HTTP {step3_resp.status_code}", status=step3_resp.status_code)
+
         except Exception as exc:
             elapsed = time.time() - t0
             last_error = str(exc)
             print(f"[SLACK] ✗ Attempt {attempt} exception after {elapsed:.2f}s: {exc}")
-            _log("WARN", f"Slack audio exception attempt {attempt}", error=str(exc))
+            _log("WARN", f"Slack Upload V2 exception attempt {attempt}", error=str(exc))
 
         if attempt < max_retries:
             time.sleep(attempt * 2)
 
-    return {"ok": False, "error": last_error or "Slack audio upload failed after retries"}
+    return {"ok": False, "error": last_error or "Slack audio Upload V2 failed after retries"}
