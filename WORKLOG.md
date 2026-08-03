@@ -1,5 +1,64 @@
 # JARVIS Worklog
 
+## 2026-08-03 - Part 4: True Factory Reset & Redesigned Severity Engine
+
+Primary Goal:
+Implement a True Factory Reset returning JARVIS to the exact state of a brand-new deployment, and redesign the AI severity classification engine to prevent over-classification into Critical/High with 0-100 confidence scoring and detailed logging.
+
+Key Accomplishments:
+
+1. **True Factory Reset (`backend/app.py`, `backend/ai/ai_router.py`)**:
+   - **Complete Runtime Wipe**: Clears `raw_articles/`, `processed/`, `daily/`, `archive/`, `data/audio/`, `data/images/`, `data/podcasts/`, `data/drafts/`, `data/reports/`, `data/cache/`, `seen.json`, `digest_state.json`, `telemetry.json`, `runtime_state.json`, `wordpress_posts.jsonl`, in-memory queue, dedupe cache, AI router status, and `event_logs` table.
+   - **Preservation Guarantee**: Preserves user accounts, admin passwords, database schema (`jarvis.db`), RSS sources, AI model providers, notification channels, `.env` file, and Hugging Face secrets.
+   - **Post-Reset Overview Metrics**:
+     - `Processed = 0`
+     - `Scraped = 0`
+     - `Cycles = 0`
+     - `Queue = 0`
+     - `Reports = 0`
+     - `Audio = 0`
+     - `Phase = Idle`
+     - `Last Cycle = Never`
+
+2. **Redesigned Severity Engine (`backend/ai/ai_router.py`, `backend/services/worker_processor.py`)**:
+   - **Hybrid Reasoning & Validation (`evaluate_severity`)**: Evaluates LLM reasoning first, then applies strict deterministic rules to cap over-classified items.
+   - **Strict Severity Definitions**:
+     - `CRITICAL`: Reserved exclusively for active in-the-wild zero-days, CISA KEV alerts, active ransomware campaigns, emergency advisories, or unauthenticated RCEs with verified exploitation.
+     - `HIGH`: Important vulnerabilities, vendor security releases, cloud security incidents, AI security flaws.
+     - `MEDIUM`: Product releases, research papers, new attack techniques, security tooling updates.
+     - `LOW`: Minor updates, small product announcements, routine advisories.
+     - `MINIMAL`: General news, opinion articles, small feature updates.
+   - **Confidence Scoring (0–100)**: Generates 0-100 confidence score based on AI reasoning and signal agreement.
+   - **Structured Debug Logging**: Logs `severity`, `confidence`, and `reason` for every evaluated article to terminal and `event_logs`.
+
+## 2026-08-03 - Complete Telegram Isolation, Slack Audio Support, and WordPress Diagnostics
+
+Primary Goal:
+Perform a production-grade audit and implementation ensuring 100% complete Telegram isolation when disabled, adding Slack Audio upload & graceful degradation support, and creating a step-by-step WordPress REST API diagnostic system.
+
+Key Audit & Architectural Accomplishments:
+
+1. **Complete Telegram Isolation (Part 1)**:
+   - **Gated Low-Level Rest Clients**: Updated `telegram_post()` and `telegram_get()` in `backend/utils/telegram_client.py` to immediately abort and return `{"ok": False, "error": "Telegram is disabled by configuration"}` when `IS_TELEGRAM_ENABLED` is False.
+   - **Gated Audio & Listener Dispatchers**: `send_audio()` in `notifier.py` and `start_listener()` in `bot_listener.py` enforce strict gating. Replaced legacy raw `_session.post` in `bot_listener.py` quiz handler with `telegram_post`.
+   - **Internet Monitor Neutralized**: Removed `https://api.telegram.org` from `TEST_URLS` in `internet_monitor.py` to eliminate network latency/hangs during connectivity checks.
+   - **Verification**: Verified zero executable requests to `api.telegram.org` when Telegram is disabled.
+
+2. **Slack Audio Support (Part 2)**:
+   - **Bot Token Detection & Upload**: Implemented `send_slack_audio()` in `backend/notifications/slack_notifier.py` supporting file uploads via Slack Bot Token (`SLACK_BOT_TOKEN`, `SLACK_CHANNEL_ID`).
+   - **Graceful Webhook Fallback**: When only Incoming Webhooks are configured, automatically degrades gracefully by posting text notice while logging that Webhooks cannot upload binary files.
+   - **Unified Notifier Dispatcher**: Updated `send_audio()` in `notifier.py` to act as the provider-agnostic audio dispatcher for `daily_summary.py`.
+   - **Admin UI Test Button**: Added `Test Slack Audio` button and API handler (`test_channel("slack_audio", ...)`).
+
+3. **WordPress REST API Diagnostics (Part 3)**:
+   - **Step-by-Step Diagnostic Suite**: Created `test_wordpress_connection()` in `newsletter_publisher.py` and endpoint `POST /api/admin/wordpress/test`.
+   - **Verification Sequence**:
+     1. `GET /wp-json/wp/v2/users/me` -> Verifies username, display name, roles, and HTTP basic auth.
+     2. **Capabilities Check** -> Evaluates `publish_posts` / `edit_posts` permissions.
+     3. **Draft Post Creation** -> Creates temporary test draft (`status: "draft"`).
+     4. **Draft Post Cleanup** -> Deletes temporary test draft (`DELETE /posts/{id}?force=true`).
+   - **Security**: Never logs passwords or publishes real articles during testing. Detailed diagnostic status rendered cleanly in Admin UI (`Testing.jsx`).
+
 ## 2026-08-03 - Admin → Factory Reset Feature
 
 Primary Goal:

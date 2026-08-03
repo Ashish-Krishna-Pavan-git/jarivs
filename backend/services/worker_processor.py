@@ -114,8 +114,9 @@ def process_item(item: dict) -> dict:
     cves       = normalize_list_field(ai_data.get("cves",[]))
     actors     = normalize_list_field(ai_data.get("actors",[]))
     affected   = normalize_list_field(ai_data.get("affected_products",[]))
-    try: confidence = int(ai_data.get("confidence",1))
-    except: confidence = 1
+    reason     = str(ai_data.get("reason", "Severity assigned by intelligence engine."))
+    try: confidence = int(ai_data.get("confidence", 50))
+    except: confidence = 50
 
     processed = {
         "title":             title,
@@ -124,6 +125,7 @@ def process_item(item: dict) -> dict:
         "severity":          severity,
         "category":          category,
         "confidence":        confidence,
+        "reason":            reason,
         "summary":           summary,
         "summary_text":      "\n".join(f"• {s}" for s in summary),
         "tags":              tags,
@@ -135,7 +137,7 @@ def process_item(item: dict) -> dict:
         "fp":                str(article.get("fp","")),
         "timestamp":         int(time.time()),
     }
-    print(f"  [PROC] ✓ {severity} | {category} | confidence={confidence}")
+    print(f"  [PROC] ✓ {severity} ({confidence}%) | {category} | Reason: {reason}")
     save_article(processed)
     tele_update("processed", severity=severity)
 

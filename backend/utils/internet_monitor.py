@@ -15,7 +15,7 @@ except Exception:
 
 TEST_URLS = [
     "https://www.google.com",
-    "https://api.telegram.org",
+    "https://api.github.com",
     "https://www.cloudflare.com",
 ]
 

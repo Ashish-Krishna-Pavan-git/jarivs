@@ -91,6 +91,14 @@ def telegram_post(
     Returns response JSON dict if successful.
     Raises RuntimeError or requests Exception on failure.
     """
+    try:
+        from backend.config.config import IS_TELEGRAM_ENABLED
+        if not IS_TELEGRAM_ENABLED:
+            print(f"[TELEGRAM] Skipped POST {endpoint}: Telegram disabled by configuration.")
+            return {"ok": False, "error": "Telegram is disabled by configuration"}
+    except Exception:
+        pass
+
     if not token:
         print("[TELEGRAM] ⚠️ Token not provided — skipping request.")
         return {"ok": False, "error": "No TELEGRAM_TOKEN provided"}
@@ -202,6 +210,14 @@ def telegram_get(
     max_retries: int = 3,
 ) -> dict[str, Any]:
     """Execute a GET request to Telegram API with IPv4 enforcement and timing."""
+    try:
+        from backend.config.config import IS_TELEGRAM_ENABLED
+        if not IS_TELEGRAM_ENABLED:
+            print(f"[TELEGRAM] Skipped GET {endpoint}: Telegram disabled by configuration.")
+            return {"ok": False, "error": "Telegram is disabled by configuration"}
+    except Exception:
+        pass
+
     if not token:
         return {"ok": False, "error": "No TELEGRAM_TOKEN provided"}
 

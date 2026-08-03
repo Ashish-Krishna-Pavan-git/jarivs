@@ -172,6 +172,40 @@ export function Testing() {
       });
   };
 
+  const [slackAudioResult, setSlackAudioResult] = useState(null);
+  const [wpDiagnosticResult, setWpDiagnosticResult] = useState(null);
+
+  const runSlackAudioTest = () => {
+    setBusyAction("Test Slack Audio");
+    setSlackAudioResult({ loading: true });
+    api("/api/admin/notification-channels/test", {
+      method: "POST",
+      body: JSON.stringify({ kind: "slack_audio" }),
+    })
+      .then((res) => {
+        setBusyAction("");
+        setSlackAudioResult(res);
+      })
+      .catch((e) => {
+        setBusyAction("");
+        setSlackAudioResult({ ok: false, error: e.message });
+      });
+  };
+
+  const runWordPressTest = () => {
+    setBusyAction("Run WordPress Diagnostics");
+    setWpDiagnosticResult({ loading: true });
+    api("/api/admin/wordpress/test", { method: "POST" })
+      .then((res) => {
+        setBusyAction("");
+        setWpDiagnosticResult(res);
+      })
+      .catch((e) => {
+        setBusyAction("");
+        setWpDiagnosticResult({ ok: false, error: e.message });
+      });
+  };
+
   const resetScheduler = () => {
     handleAction("Reset Scheduler", "/api/admin/testing/reset-scheduler");
   };
@@ -296,8 +330,94 @@ export function Testing() {
               {busyAction === "Generate Intelligence Report" ? "Generating..." : "Run Report Generation"}
             </Button>
           </div>
+          <div className="card-box">
+            <h3><Slack size={16} /> Test Slack Audio</h3>
+            <p className="muted" style={{ fontSize: "0.85rem", marginBottom: "0.75rem" }}>
+              Uploads a test audio file via Slack Bot Token or verifies graceful degradation on Webhooks.
+            </p>
+            <Button icon={Slack} onClick={runSlackAudioTest} disabled={Boolean(busyAction)}>
+              {busyAction === "Test Slack Audio" ? "Uploading..." : "Test Slack Audio"}
+            </Button>
+          </div>
+
+          <div className="card-box">
+            <h3><FileText size={16} /> WordPress Diagnostics</h3>
+            <p className="muted" style={{ fontSize: "0.85rem", marginBottom: "0.75rem" }}>
+              Tests authentication, user roles, capabilities, and temporary draft creation/cleanup.
+            </p>
+            <Button icon={FileText} onClick={runWordPressTest} disabled={Boolean(busyAction)}>
+              {busyAction === "Run WordPress Diagnostics" ? "Running..." : "Test WordPress API"}
+            </Button>
+          </div>
         </div>
       </div>
+
+      {/* Render Slack Audio Diagnostic Results */}
+      {slackAudioResult && (
+        <div className="panel">
+          <h2>Slack Audio Upload Diagnostic</h2>
+          {slackAudioResult.loading ? (
+            <p className="muted">Uploading sample audio file to Slack...</p>
+          ) : slackAudioResult.ok ? (
+            <div className="card-box" style={{ background: "rgba(16, 185, 129, 0.08)", borderColor: "var(--color-success, #10b981)" }}>
+              <h4 style={{ color: "var(--color-success, #10b981)" }}>✓ Slack Audio Upload Succeeded</h4>
+              <p style={{ fontSize: "0.9rem" }}>{slackAudioResult.message}</p>
+            </div>
+          ) : (
+            <div className="card-box" style={{ background: "rgba(245, 158, 11, 0.08)", borderColor: "var(--color-warning, #f59e0b)" }}>
+              <h4 style={{ color: "var(--color-warning, #f59e0b)" }}>
+                {slackAudioResult.reason === "webhook_only" ? "⚠️ Webhook Only Mode (Graceful Fallback)" : "✗ Slack Audio Failed"}
+              </h4>
+              <p style={{ fontSize: "0.9rem" }}>{slackAudioResult.message || slackAudioResult.error}</p>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Render WordPress Diagnostic Results */}
+      {wpDiagnosticResult && (
+        <div className="panel">
+          <h2>WordPress REST API Diagnostic Results</h2>
+          {wpDiagnosticResult.loading ? (
+            <p className="muted">Connecting to WordPress REST API and verifying credentials/roles...</p>
+          ) : (
+            <div>
+              <div
+                className="card-box"
+                style={{
+                  background: wpDiagnosticResult.ok ? "rgba(16, 185, 129, 0.08)" : "rgba(239, 68, 68, 0.08)",
+                  borderColor: wpDiagnosticResult.ok ? "var(--color-success, #10b981)" : "var(--color-error, #ef4444)",
+                  marginBottom: "1rem",
+                }}
+              >
+                <h4 style={{ color: wpDiagnosticResult.ok ? "var(--color-success, #10b981)" : "var(--color-error, #ef4444)" }}>
+                  {wpDiagnosticResult.ok ? "✓ WordPress Diagnostics Passed" : "✗ WordPress Diagnostics Failed"}
+                </h4>
+                <p style={{ fontSize: "0.9rem" }}>{wpDiagnosticResult.message || wpDiagnosticResult.error}</p>
+              </div>
+
+              {wpDiagnosticResult.steps && (
+                <Table
+                  rows={wpDiagnosticResult.steps}
+                  columns={[
+                    { label: "Step", key: "step" },
+                    {
+                      label: "Status",
+                      render: (r) =>
+                        r.ok ? (
+                          <span style={{ color: "var(--color-success, #10b981)", fontWeight: "bold" }}>✓ OK</span>
+                        ) : (
+                          <span style={{ color: "var(--color-error, #ef4444)", fontWeight: "bold" }}>✗ Failed</span>
+                        ),
+                    },
+                    { label: "Detail", render: (r) => <span style={{ fontSize: "0.85rem" }}>{r.detail}</span> },
+                  ]}
+                />
+              )}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Component Diagnostics */}
       <div className="panel">

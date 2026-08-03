@@ -167,6 +167,24 @@ Be specific, concrete, and use real names, CVE IDs, and product names.
 You MUST return ONLY valid JSON. Escape internal quotes with \\\"."""
 
 
+def reset_ai_status():
+    """Reset AI status counters for Factory Reset."""
+    global _ai_status
+    _ai_status = {
+        "last_task": None,
+        "last_provider": None,
+        "last_model": None,
+        "last_latency_ms": None,
+        "last_fallback_used": False,
+        "last_success": True,
+        "last_error": None,
+        "last_called_at": None,
+        "total_calls": 0,
+        "total_fallbacks": 0,
+        "total_failures": 0,
+    }
+
+
 def build_analysis_prompt(title, content):
     return f"""{SYSTEM_PROMPT}
 
@@ -179,8 +197,9 @@ Content:
 Return ONLY this JSON:
 {{
   "severity": "CRITICAL|HIGH|MEDIUM|LOW|MINIMAL",
+  "confidence": 0-100,
+  "reason": "Clear 1-sentence justification for the severity assignment",
   "category": "cybersec|ai|tech|mobile|hardware|newsletter|business",
-  "confidence": 1-10,
   "summary": [
     "What happened — the core finding in one clear sentence",
     "How it works — the technical mechanism or attack vector",
@@ -193,15 +212,14 @@ Return ONLY this JSON:
   "affected_products": ["product name vX.X"]
 }}
 
-SEVERITY:
-- CRITICAL: Active exploitation, zero-day, RCE, mass impact right now
-- HIGH: Serious unpatched flaw, confirmed targeted attack, major breach
-- MEDIUM: Patched CVE, contained campaign, notable advisory
-- LOW: General tech/AI news, product launches, industry developments
-- MINIMAL: Opinion, marketing, non-technical content
+STRICT SEVERITY DEFINITIONS:
+- CRITICAL: Reserved ONLY for active zero-days, active in-the-wild exploitation, emergency CISA KEV advisories, major nation-state/ransomware attacks causing active disruption, or critical supply chain compromises.
+- HIGH: Important vulnerabilities (unpatched or vendor advisories), major vendor security releases, cloud security incidents, AI security flaws.
+- MEDIUM: Product releases, technical research papers, new attack techniques, security tooling updates, significant tech news.
+- LOW: Minor updates, small product announcements, routine advisories without active threat.
+- MINIMAL: General news, opinion articles, small feature updates.
 
-category must be ONE value from the list. Never pipe-separate.
-Return ONLY the JSON."""
+category must be ONE value from the list. Return ONLY the JSON."""
 
 
 def build_digest_prompt(items_text, cycle_label):
@@ -473,21 +491,160 @@ def local_call_text(prompt):
     return r
 
 
+# ─── Redesigned Severity Engine ────────────────────────────────────────────────
+_CRIT_TRIGGERS = [
+    "zero-day", "0-day", "actively exploited", "in the wild", "active exploitation",
+    "cisa kev", "emergency advisory", "unauthenticated rce", "supply chain attack",
+    "supply-chain attack", "supply chain compromise", "nation-state attack", "ransomware attack",
+    "critical vulnerability", "mass exploitation"
+]
+
+_HIGH_TRIGGERS = [
+    "vulnerability", "cve-", "privilege escalation", "malware", "apt",
+    "ransomware", "breach", "data leak", "backdoor", "trojan", "phishing campaign",
+    "security update", "security release", "advisory", "patch tuesday", "remote code execution"
+]
+
+_MED_TRIGGERS = [
+    "release", "update", "research", "paper", "tooling", "framework", "architecture",
+    "analysis", "feature", "model", "benchmarks", "announcement"
+]
+
+_HISTORICAL_TRIGGERS = [
+    "retrospective", "history of", "years ago", "look back", "evolution of",
+    "timeline of", "news events that shaped", "decade of"
+]
+
+
+def evaluate_severity(title: str, content: str, ai_data: dict | None = None) -> dict:
+    """
+    Redesigned Severity Engine:
+    Combines AI reasoning with deterministic validation rules, strict severity capping
+    to prevent over-classification into Critical/High, 0-100 confidence scoring,
+    and detailed logging.
+    """
+    text = (title + " " + content).lower()
+
+    ai_sev = str((ai_data or {}).get("severity", "")).upper()
+    ai_conf = (ai_data or {}).get("confidence")
+    ai_reason = str((ai_data or {}).get("reason", "")).strip()
+
+    try:
+        raw_conf = int(ai_conf)
+        conf = raw_conf * 10 if 0 < raw_conf <= 10 else min(100, max(0, raw_conf))
+    except Exception:
+        conf = 70 if ai_sev else 50
+
+    has_crit_trigger = any(kw in text for kw in _CRIT_TRIGGERS)
+    has_high_trigger = any(kw in text for kw in _HIGH_TRIGGERS)
+    has_med_trigger = any(kw in text for kw in _MED_TRIGGERS)
+    is_historical = any(kw in text for kw in _HISTORICAL_TRIGGERS)
+
+    # 1. CRITICAL Validation
+    if ai_sev == "CRITICAL":
+        if is_historical:
+            final_sev = "MEDIUM"
+            conf = min(conf, 70)
+            reason = "Capped from CRITICAL to MEDIUM: Historical/retrospective content."
+        elif has_crit_trigger or (ai_data and ai_data.get("cves") and conf >= 80):
+            final_sev = "CRITICAL"
+            conf = max(conf, 85)
+            reason = ai_reason or "Verified CRITICAL: Active zero-day/exploitation signals present."
+        else:
+            final_sev = "HIGH"
+            conf = min(conf, 75)
+            reason = ai_reason or "Capped from CRITICAL to HIGH: Lacks active exploitation or zero-day triggers."
+
+    # 2. HIGH Validation
+    elif ai_sev == "HIGH":
+        if is_historical:
+            final_sev = "LOW"
+            conf = min(conf, 65)
+            reason = "Capped from HIGH to LOW: Historical content."
+        elif has_crit_trigger and not is_historical:
+            final_sev = "CRITICAL"
+            conf = max(conf, 85)
+            reason = "Upgraded to CRITICAL: Strong active exploitation/zero-day signals detected."
+        elif has_high_trigger or (ai_data and ai_data.get("cves")):
+            final_sev = "HIGH"
+            conf = max(conf, 75)
+            reason = ai_reason or "Verified HIGH: Important vulnerability or security advisory."
+        else:
+            final_sev = "MEDIUM"
+            conf = min(conf, 70)
+            reason = ai_reason or "Capped from HIGH to MEDIUM: Lacks security advisory/vulnerability triggers."
+
+    # 3. MEDIUM / LOW / MINIMAL Validation
+    elif ai_sev in ("MEDIUM", "LOW", "MINIMAL"):
+        if has_crit_trigger and not is_historical:
+            final_sev = "CRITICAL" if conf >= 70 else "HIGH"
+            conf = max(conf, 80)
+            reason = f"Upgraded to {final_sev}: High-risk zero-day/exploitation signals present."
+        elif ai_sev == "MEDIUM":
+            final_sev = "MEDIUM"
+            reason = ai_reason or "Verified MEDIUM: Standard research, product release, or tech news."
+        elif ai_sev == "LOW":
+            final_sev = "LOW"
+            reason = ai_reason or "Verified LOW: Routine update or minor announcement."
+        else:
+            final_sev = "MINIMAL"
+            reason = ai_reason or "Verified MINIMAL: General news, opinion, or non-technical content."
+
+    # 4. Deterministic Fallback (AI unavailable)
+    else:
+        if is_historical:
+            final_sev = "LOW"
+            conf = 50
+            reason = "Fallback: Historical content."
+        elif has_crit_trigger:
+            final_sev = "HIGH"
+            conf = 65
+            reason = "Fallback: Critical security keywords detected without AI verification."
+        elif has_high_trigger:
+            final_sev = "MEDIUM"
+            conf = 60
+            reason = "Fallback: Security keywords detected."
+        elif has_med_trigger:
+            final_sev = "MEDIUM"
+            conf = 55
+            reason = "Fallback: Product/tech keywords detected."
+        else:
+            final_sev = "LOW"
+            conf = 50
+            reason = "Fallback: General content."
+
+    print(f"[SEVERITY_ENGINE] Title: '{title[:50]}...' -> {final_sev} ({conf}%) | Reason: {reason}")
+    try:
+        from jarvis_db import log_event
+        log_event("INFO", "severity_engine", f"Assigned {final_sev} ({conf}%)", {
+            "title": title[:100], "severity": final_sev, "confidence": conf, "reason": reason
+        })
+    except Exception:
+        pass
+
+    return {"severity": final_sev, "confidence": conf, "reason": reason}
+
+
 # ─── Public Analysis ──────────────────────────────────────────────────────────
 def ai_analyze(title, content):
-    raw  = local_call_article(build_analysis_prompt(title, content))
-    data = extract_json(raw)
-    sev_order = ["MINIMAL","LOW","MEDIUM","HIGH","CRITICAL"]
-    kw_sev    = keyword_severity(title, content)
-    if data:
-        ai_sev = data.get("severity","LOW")
-        ai_idx = sev_order.index(ai_sev) if ai_sev in sev_order else 2
-        kw_idx = sev_order.index(kw_sev)
-        data["severity"] = sev_order[max(ai_idx, kw_idx)]
-        return data
-    return {"severity":kw_sev,"category":"tech","confidence":1,
-            "summary":["AI analysis unavailable — keyword classification applied"],
-            "tags":[],"cves":[],"actors":[],"affected_products":[]}
+    raw = local_call_article(build_analysis_prompt(title, content))
+    data = extract_json(raw) or {}
+    
+    sev_eval = evaluate_severity(title, content, data)
+    
+    data["severity"] = sev_eval["severity"]
+    data["confidence"] = sev_eval["confidence"]
+    data["reason"] = sev_eval["reason"]
+    if "category" not in data:
+        data["category"] = "tech"
+    if "summary" not in data or not data["summary"]:
+        data["summary"] = ["Summary unavailable — initial processing completed."]
+    if "tags" not in data: data["tags"] = []
+    if "cves" not in data: data["cves"] = []
+    if "actors" not in data: data["actors"] = []
+    if "affected_products" not in data: data["affected_products"] = []
+    
+    return data
 
 
 def ai_digest(items, cycle_label="8-hour cycle"):

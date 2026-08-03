@@ -111,12 +111,12 @@ Return ONLY this JSON:
     data = extract_json(raw)
     if data and "question" in data and len(data.get("options",[]))>=2:
         try:
-            _session.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPoll", json={
-                "chat_id":chat_id,"question":data["question"][:300],
-                "options":data["options"][:10],"type":"quiz",
-                "correct_option_id":int(data.get("correct_index",0)),
-                "explanation":str(data.get("explanation",""))[:200],"is_anonymous":False,
-            }, timeout=40)
+            telegram_post("sendPoll", TELEGRAM_TOKEN, payload={
+                "chat_id": chat_id, "question": data["question"][:300],
+                "options": data["options"][:10], "type": "quiz",
+                "correct_option_id": int(data.get("correct_index", 0)),
+                "explanation": str(data.get("explanation", ""))[:200], "is_anonymous": False,
+            }, connect_timeout=10.0, read_timeout=30.0, max_retries=1)
         except Exception as e:
             send_reply(chat_id, f"⚠️ Quiz delivery error: {e}")
     else:

@@ -330,3 +330,146 @@ def publish_to_wordpress(ai_summary: dict, all_items: list) -> dict | None:
 def save_and_publish_newsletter(ai_summary: dict, all_items: list) -> None:
     """Legacy alias kept for compatibility with daily_summary.py callers."""
     publish_to_wordpress(ai_summary, all_items)
+
+
+def test_wordpress_connection() -> dict:
+    """
+    Comprehensive, non-destructive diagnostic test for WordPress REST API integration.
+    
+    Steps:
+    1. GET /wp-json/wp/v2/users/me -> Verify authentication.
+    2. Capabilities verification -> Check post creation permissions.
+    3. Draft Post Creation -> Creates temporary test draft.
+    4. Draft Post Cleanup -> Deletes temporary test draft.
+    
+    Never publishes a live article during testing. Never logs passwords.
+    """
+    wp_url = os.getenv("WP_URL", "").rstrip("/")
+    wp_user = os.getenv("WP_USER", "")
+    wp_app_pass = os.getenv("WP_APP_PASSWORD", "")
+
+    steps: list[dict] = []
+
+    if not wp_url:
+        return {
+            "ok": False,
+            "error": "WP_URL environment variable is not configured.",
+            "steps": [{"step": "configuration", "ok": False, "detail": "WP_URL is missing"}]
+        }
+    if not wp_user or not wp_app_pass:
+        return {
+            "ok": False,
+            "error": "WP_USER or WP_APP_PASSWORD environment variable is not configured.",
+            "steps": [{"step": "configuration", "ok": False, "detail": "WP credentials missing"}]
+        }
+
+    api_root = f"{wp_url}/wp-json/wp/v2"
+    auth, hdr = _auth()
+
+    # Step 1: Authentication Test (GET /users/me)
+    t0 = time.time()
+    try:
+        resp = requests.get(f"{api_root}/users/me", auth=auth, headers=hdr, timeout=15)
+        elapsed1 = round(time.time() - t0, 2)
+        if resp.status_code == 200:
+            user_data = resp.json()
+            username = user_data.get("slug") or user_data.get("name") or wp_user
+            display_name = user_data.get("name", "")
+            roles = user_data.get("roles", [])
+            capabilities = user_data.get("capabilities", {})
+            steps.append({
+                "step": "authentication",
+                "ok": True,
+                "detail": f"Authenticated successfully as '{username}' (Display: '{display_name}') in {elapsed1}s",
+                "user": {"username": username, "display_name": display_name, "roles": roles}
+            })
+        else:
+            body_snippet = resp.text[:300].replace("\n", " ")
+            err_msg = f"Authentication failed (HTTP {resp.status_code}): {body_snippet}"
+            if resp.status_code == 401:
+                err_msg = (
+                    f"Authentication failed (HTTP 401 rest_cannot_create / rest_not_logged_in).\n"
+                    f"Possible causes:\n"
+                    f"1. Application Password for user '{wp_user}' is incorrect or revoked.\n"
+                    f"2. Web server (Apache/Nginx/cPanel) is stripping Authorization headers.\n"
+                    f"3. Application Passwords feature is disabled in WordPress."
+                )
+            steps.append({"step": "authentication", "ok": False, "detail": err_msg})
+            return {"ok": False, "error": err_msg, "steps": steps}
+    except Exception as exc:
+        err_msg = f"Connection error during authentication: {exc}"
+        steps.append({"step": "authentication", "ok": False, "detail": err_msg})
+        return {"ok": False, "error": err_msg, "steps": steps}
+
+    # Step 2: Capability Check
+    user_roles = steps[0].get("user", {}).get("roles", [])
+    has_publish_role = any(r in ("administrator", "editor", "author") for r in user_roles)
+    can_publish = has_publish_role or capabilities.get("publish_posts", False) or capabilities.get("edit_posts", False)
+    
+    if can_publish:
+        steps.append({
+            "step": "capabilities",
+            "ok": True,
+            "detail": f"Role '{', '.join(user_roles)}' has post creation & publishing permissions."
+        })
+    else:
+        warn_msg = f"User role '{', '.join(user_roles)}' may lack publish_posts capability (Subscriber/Contributor)."
+        steps.append({"step": "capabilities", "ok": False, "detail": warn_msg})
+
+    # Step 3: Temporary Draft Creation Test
+    draft_id = None
+    t1 = time.time()
+    try:
+        draft_payload = {
+            "title": "JARVIS System Diagnostic Draft (Auto-Cleanup)",
+            "content": "<p>Temporary draft created by JARVIS system diagnostic test.</p>",
+            "status": "draft",
+            "slug": f"jarvis-test-draft-{int(time.time())}"
+        }
+        resp_draft = requests.post(f"{api_root}/posts", auth=auth, headers=hdr, json=draft_payload, timeout=20)
+        elapsed2 = round(time.time() - t1, 2)
+        if resp_draft.status_code in (200, 201):
+            draft_data = resp_draft.json()
+            draft_id = draft_data.get("id")
+            steps.append({
+                "step": "draft_creation",
+                "ok": True,
+                "detail": f"Successfully created temporary draft post (ID {draft_id}) in {elapsed2}s"
+            })
+        else:
+            body_snippet = resp_draft.text[:300].replace("\n", " ")
+            err_msg = f"Draft creation failed (HTTP {resp_draft.status_code}): {body_snippet}"
+            steps.append({"step": "draft_creation", "ok": False, "detail": err_msg})
+            return {"ok": False, "error": err_msg, "steps": steps}
+    except Exception as exc:
+        err_msg = f"Draft creation error: {exc}"
+        steps.append({"step": "draft_creation", "ok": False, "detail": err_msg})
+        return {"ok": False, "error": err_msg, "steps": steps}
+
+    # Step 4: Temporary Draft Cleanup
+    if draft_id:
+        t2 = time.time()
+        try:
+            resp_del = requests.delete(f"{api_root}/posts/{draft_id}", auth=auth, headers=hdr, params={"force": True}, timeout=20)
+            elapsed3 = round(time.time() - t2, 2)
+            if resp_del.status_code in (200, 201):
+                steps.append({
+                    "step": "draft_cleanup",
+                    "ok": True,
+                    "detail": f"Successfully deleted temporary draft post (ID {draft_id}) in {elapsed3}s"
+                })
+            else:
+                steps.append({
+                    "step": "draft_cleanup",
+                    "ok": False,
+                    "detail": f"Draft created (ID {draft_id}) but cleanup returned HTTP {resp_del.status_code}"
+                })
+        except Exception as exc:
+            steps.append({"step": "draft_cleanup", "ok": False, "detail": f"Draft cleanup error: {exc}"})
+
+    return {
+        "ok": True,
+        "message": f"WordPress REST API connection test passed! User '{wp_user}' is authenticated and authorized.",
+        "user": steps[0].get("user"),
+        "steps": steps
+    }

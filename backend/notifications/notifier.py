@@ -365,9 +365,19 @@ def test_channel(kind, target, secret=None):
         err = str(res.get("error", "Unknown error"))
         _log("ERROR", "Telegram test failed", chat_id=target, error=err[:300])
         return {"ok": False, "error": err[:300]}
-    if kind == "slack":
+    if kind in ("slack", "slack_audio"):
         if not IS_SLACK_ENABLED:
             return {"ok": False, "error": "Slack is disabled in this deployment."}
+        if kind == "slack_audio":
+            from slack_notifier import send_slack_audio
+            test_audio_dir = os.path.join(os.getenv("JARVIS_DATA_DIR", "/tmp/jarvis/data"), "audio")
+            os.makedirs(test_audio_dir, exist_ok=True)
+            test_audio_path = os.path.join(test_audio_dir, "slack_test_sample.mp3")
+            if not os.path.exists(test_audio_path):
+                with open(test_audio_path, "wb") as f:
+                    f.write(b"ID3\x04\x00\x00\x00\x00\x00\x00JARVIS SLACK TEST AUDIO SAMPLE")
+            return send_slack_audio(test_audio_path, caption="✅ JARVIS test audio — verifying Slack audio upload")
+
         webhook = str(secret.get("webhook_url") or target or "").strip()
         if not webhook:
             return {"ok": False, "error": "Slack webhook URL is required"}
@@ -385,17 +395,54 @@ def test_channel(kind, target, secret=None):
     return {"ok": False, "error": f"Unknown channel kind: {kind}"}
 
 def send_audio(filepath, caption="🎙️ JARVIS Daily Audio Briefing"):
-    if not TELEGRAM_TOKEN or not os.path.exists(filepath):
+    """
+    Provider-agnostic audio notification dispatcher.
+    Routes to Telegram and/or Slack based on NOTIFICATION_PROVIDER configuration.
+    """
+    from backend.config.config import IS_TELEGRAM_ENABLED, IS_SLACK_ENABLED
+
+    if not os.path.exists(filepath):
+        _log("WARN", f"Audio send skipped: File not found ({filepath})")
         return False
-    ok = False
-    for cid in set(_get_subs()):
-        if not cid:
-            continue
+
+    tg_ok = False
+    slack_ok = False
+
+    # 1. Telegram audio delivery
+    if IS_TELEGRAM_ENABLED:
+        if TELEGRAM_TOKEN:
+            subs = set(_get_subs())
+            for cid in subs:
+                if not cid:
+                    continue
+                try:
+                    with open(filepath, "rb") as audio:
+                        res = telegram_post("sendAudio", TELEGRAM_TOKEN, payload={"chat_id": cid, "caption": caption}, files={"audio": audio}, connect_timeout=15.0, read_timeout=90.0, max_retries=3)
+                        if res.get("ok"):
+                            tg_ok = True
+                except Exception as e:
+                    print(f"[NOTIFIER] Telegram audio error: {e}")
+        else:
+            _log("WARN", "Telegram audio skipped: TELEGRAM_TOKEN not configured")
+    else:
+        print("[NOTIFIER] Telegram disabled by configuration — skipping audio send")
+
+    # 2. Slack audio delivery
+    if IS_SLACK_ENABLED:
         try:
-            with open(filepath, "rb") as audio:
-                res = telegram_post("sendAudio", TELEGRAM_TOKEN, payload={"chat_id": cid, "caption": caption}, files={"audio": audio}, connect_timeout=15.0, read_timeout=90.0, max_retries=3)
-                if res.get("ok"):
-                    ok = True
+            from slack_notifier import send_slack_audio
+            res = send_slack_audio(filepath, caption=caption)
+            slack_ok = bool(res.get("ok"))
         except Exception as e:
-            print(f"[NOTIFIER] Audio error: {e}")
-    return ok
+            print(f"[NOTIFIER] Slack audio error: {e}")
+            _log("ERROR", f"Slack audio error: {e}")
+    else:
+        print("[NOTIFIER] Slack disabled by configuration — skipping audio send")
+
+    if IS_TELEGRAM_ENABLED and IS_SLACK_ENABLED:
+        return tg_ok or slack_ok
+    elif IS_TELEGRAM_ENABLED:
+        return tg_ok
+    elif IS_SLACK_ENABLED:
+        return slack_ok
+    return True
