@@ -1,5 +1,28 @@
 # JARVIS Worklog
 
+## 2026-08-03 - Live Config Reload, True Factory Reset & Slack Component Fix
+
+Primary Goal:
+Fix frontend `ReferenceError: Slack is not defined` crash on the Admin Testing page, implement live runtime configuration reloading without requiring full application redeployments, and ensure True Factory Reset cleans all runtime assets and syncs clean state to Hugging Face Datasets.
+
+Key Accomplishments:
+
+1. **Fixed "Slack is not defined" (`frontend/src/pages/admin/Testing.jsx`)**:
+   - **Root Cause**: `Slack` icon was used in JSX components (`<Slack size={16} />`) but omitted from the `lucide-react` import statement.
+   - **Fix**: Added `Slack` to the `lucide-react` import statement in `Testing.jsx`.
+   - **Disabled State Handling**: Guaranteed that if Slack is disabled or not configured, the UI renders a clean, friendly notification card without throwing an uncaught exception.
+
+2. **Live Configuration Reload (`backend/config/config.py`, `backend/app.py`, `Testing.jsx`)**:
+   - **Backend Engine**: Implemented `reload_config()` in `config.py` which re-reads `.env` and updates all module-level variables (`NOTIFICATION_PROVIDER`, `IS_SLACK_ENABLED`, `IS_TELEGRAM_ENABLED`, `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID`, `TELEGRAM_MODE`, `CYCLE_HOURS`, etc.) at runtime.
+   - **API Endpoints**: Registered `POST /api/admin/config/reload` and `POST /api/admin/testing/reload-config`.
+   - **Frontend Integration**: Updated the "Reload Configuration" button in `Testing.jsx` to invoke the reload API and immediately refresh live overview state (`loadLiveState()`) without redeployment.
+
+3. **True Factory Reset & HF Storage Sync (`backend/app.py`, `backend/storage/storage_backend.py`)**:
+   - Wipes all runtime data: scraped/processed articles, seen cache, digest state, telemetry, runtime state, queue, daily/archive reports, audio briefings, podcasts, images, drafts, wordpress post logs, AI router cache, and event logs.
+   - If Hugging Face dataset storage is configured (`is_configured()`), automatically syncs the clean initial state (`seen.json`, `telemetry.json`, `digest_state.json`, `runtime_state.json`) to the remote HF Dataset.
+   - Preserves user accounts, admin passwords, database schema (`jarvis.db`), RSS sources, AI model providers, notification channels, `.env`, and Hugging Face secrets.
+   - Displays post-reset dashboard metrics: `Processed=0, Scraped=0, Cycles=0, Queue=0, Reports=0, Audio=0, Phase=Idle, Last Cycle=Never`.
+
 ## 2026-08-03 - Part 4: True Factory Reset & Redesigned Severity Engine
 
 Primary Goal:

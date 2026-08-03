@@ -16,6 +16,7 @@ import {
   Rss,
   Server,
   ShieldAlert,
+  Slack,
   Trash2,
   Zap,
   Terminal,
@@ -211,7 +212,17 @@ export function Testing() {
   };
 
   const reloadConfig = () => {
-    handleAction("Reload Configuration", "/api/admin/testing/reload-config");
+    setBusyAction("Reload Configuration");
+    api("/api/admin/config/reload", { method: "POST" })
+      .then((res) => {
+        setBusyAction("");
+        setNotice("Configuration & .env reloaded successfully");
+        loadLiveState();
+      })
+      .catch((e) => {
+        setBusyAction("");
+        setError(`Reload config failed: ${e.message}`);
+      });
   };
 
   const rt = data?.runtime || {};

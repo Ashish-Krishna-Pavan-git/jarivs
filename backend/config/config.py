@@ -101,6 +101,40 @@ def set_notification_provider(provider: str) -> dict:
     
     return {"ok": True, "provider": provider, "slack_enabled": IS_SLACK_ENABLED, "telegram_enabled": IS_TELEGRAM_ENABLED}
 
+def reload_config() -> dict:
+    """Reload .env and refresh module-level configuration variables in place."""
+    load_dotenv(override=True)
+
+    global GEMINI_API_KEY, GROQ_API_KEY, HF_TOKEN, HF_STORAGE_REPO
+    global TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_MODE
+    global NOTIFICATION_PROVIDER, IS_SLACK_ENABLED, IS_TELEGRAM_ENABLED
+    global CYCLE_HOURS, CYCLE_INTERVAL, DAILY_SUMMARY_HOUR
+
+    GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")
+    GROQ_API_KEY    = os.getenv("GROQ_API_KEY", "")
+    HF_TOKEN        = os.getenv("HF_TOKEN", "")
+    HF_STORAGE_REPO = os.getenv("HF_STORAGE_REPO", "")
+
+    TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
+    TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+    TELEGRAM_MODE    = os.getenv("TELEGRAM_MODE", "polling")
+
+    NOTIFICATION_PROVIDER = _resolve_notification_provider()
+    IS_SLACK_ENABLED     = NOTIFICATION_PROVIDER in ("slack", "both")
+    IS_TELEGRAM_ENABLED  = NOTIFICATION_PROVIDER in ("telegram", "both")
+
+    CYCLE_HOURS        = int(os.getenv("CYCLE_HOURS", 8))
+    CYCLE_INTERVAL     = CYCLE_HOURS * 3600
+    DAILY_SUMMARY_HOUR = int(os.getenv("DAILY_SUMMARY_HOUR", 7))
+
+    return {
+        "ok": True,
+        "provider": NOTIFICATION_PROVIDER,
+        "slack_enabled": IS_SLACK_ENABLED,
+        "telegram_enabled": IS_TELEGRAM_ENABLED,
+        "is_hf": IS_HF or bool(os.getenv("HF_SPACE_URL") or os.getenv("SPACE_ID")),
+    }
+
 # ─────────────────────────────────────────────────────────────
 # SCHEDULER
 # ─────────────────────────────────────────────────────────────

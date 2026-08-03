@@ -851,14 +851,16 @@ def testing_reset_scheduler():
     return jsonify({"ok": True})
 
 
+@app.route("/api/admin/config/reload", methods=["POST"])
 @app.route("/api/admin/testing/reload-config", methods=["POST"])
 @require_admin
 @require_csrf
 def testing_reload_config():
-    load_dotenv(ROOT / ".env", override=True)
+    from backend.config.config import reload_config
+    res = reload_config()
     init_db()
-    log_event("INFO", "testing", "Configuration and .env reloaded")
-    return jsonify({"ok": True})
+    log_event("INFO", "config", "Configuration reloaded at runtime", res)
+    return jsonify({"ok": True, "config": res})
 
 
 _scheduler_proc = None
@@ -981,6 +983,15 @@ def admin_factory_reset():
         clear_logs()
     except Exception as exc:
         uncleared.append(f"Event logs: {exc}")
+
+    # 6b. Sync Clean Reset State to Hugging Face Dataset if storage is enabled
+    if is_configured():
+        try:
+            from backend.storage.storage_backend import push_state
+            push_state()
+            print("[HF_STORAGE] ✓ Synced clean reset state to HF Dataset")
+        except Exception as exc:
+            uncleared.append(f"HF storage sync: {exc}")
 
     # 7. Restart Scheduler Subprocess
     new_pid = None
