@@ -863,6 +863,40 @@ def testing_reload_config():
     return jsonify({"ok": True, "config": res})
 
 
+@app.route("/api/admin/models/summary", methods=["GET"])
+@require_admin
+def admin_models_summary():
+    from ai_router import get_models_summary
+    return jsonify(get_models_summary())
+
+
+@app.route("/api/admin/mcp/source-audit", methods=["POST"])
+@require_admin
+@require_csrf
+def admin_mcp_source_audit():
+    from backend.mcp.source_auditor import mcp_audit_sources
+    res = mcp_audit_sources()
+    log_event("INFO", "mcp", "Executed MCP Source Audit", res.get("summary", {}))
+    return jsonify(res)
+
+
+@app.route("/api/admin/channels/<int:channel_id>", methods=["DELETE"])
+@app.route("/api/admin/notification-channels/<int:channel_id>", methods=["DELETE"])
+@require_admin
+@require_csrf
+def admin_channel_delete(channel_id):
+    from jarvis_db import delete_notification_channel
+    delete_notification_channel(channel_id)
+    if is_configured():
+        try:
+            from backend.storage.storage_backend import push_state
+            push_state()
+        except Exception:
+            pass
+    log_event("INFO", "notifier", f"Deleted notification channel {channel_id}")
+    return jsonify({"ok": True})
+
+
 _scheduler_proc = None
 
 

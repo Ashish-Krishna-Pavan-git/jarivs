@@ -389,15 +389,21 @@ MIGRATIONS = (
 
 def _seed_defaults(db: sqlite3.Connection) -> None:
     now = datetime.now(timezone.utc).isoformat()
-    for name, url, category in DEFAULT_SOURCES:
-        db.execute("INSERT OR IGNORE INTO sources(name,url,category,enabled,created_at,updated_at) VALUES(?,?,?,1,?,?)", (name, url, category, now, now))
-    for row in DEFAULT_MODEL_PROVIDERS:
-        db.execute("INSERT OR IGNORE INTO model_providers(name,provider_type,model,base_url,api_key_env,enabled,min_interval,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)", (*row, now, now))
-    for task, providers in DEFAULT_MODEL_ROUTES.items():
-        for priority, provider in enumerate(providers, 1):
-            db.execute("INSERT OR IGNORE INTO model_routes(task,provider_name,priority,enabled) VALUES(?,?,?,1)", (task, provider, priority))
-    for name, kind in [("telegram", "telegram"), ("slack", "slack")]:
-        db.execute("INSERT OR IGNORE INTO integrations(name,kind,enabled,config_json,created_at,updated_at) VALUES(?,?,0,?,?,?)", (name, kind, encrypt_json({}), now, now))
+    # Seed default sources ONLY if sources table is empty (prevents resurrecting deleted sources)
+    if db.execute("SELECT COUNT(*) FROM sources").fetchone()[0] == 0:
+        for name, url, category in DEFAULT_SOURCES:
+            db.execute("INSERT INTO sources(name,url,category,enabled,created_at,updated_at) VALUES(?,?,?,1,?,?)", (name, url, category, now, now))
+    # Seed default model providers ONLY if model_providers table is empty
+    if db.execute("SELECT COUNT(*) FROM model_providers").fetchone()[0] == 0:
+        for row in DEFAULT_MODEL_PROVIDERS:
+            db.execute("INSERT INTO model_providers(name,provider_type,model,base_url,api_key_env,enabled,min_interval,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)", (*row, now, now))
+    if db.execute("SELECT COUNT(*) FROM model_routes").fetchone()[0] == 0:
+        for task, providers in DEFAULT_MODEL_ROUTES.items():
+            for priority, provider in enumerate(providers, 1):
+                db.execute("INSERT INTO model_routes(task,provider_name,priority,enabled) VALUES(?,?,?,1)", (task, provider, priority))
+    if db.execute("SELECT COUNT(*) FROM integrations").fetchone()[0] == 0:
+        for name, kind in [("telegram", "telegram"), ("slack", "slack")]:
+            db.execute("INSERT INTO integrations(name,kind,enabled,config_json,created_at,updated_at) VALUES(?,?,0,?,?,?)", (name, kind, encrypt_json({}), now, now))
 
 
 def init_db() -> None:
@@ -692,6 +698,16 @@ def upsert_notification_channel(data: dict[str, Any], user_id: int | None = None
 
 def disable_notification_channel(channel_id: int, user_id: int | None = None) -> None:
     sql, params = "UPDATE notification_channels SET enabled=0,updated_at=? WHERE id=?", [datetime.now(timezone.utc).isoformat(), int(channel_id)]
+    if user_id is not None:
+        sql += " AND user_id=?"
+        params.append(int(user_id))
+    with _lock, _connect() as db:
+        db.execute(sql, params)
+
+
+def delete_notification_channel(channel_id: int, user_id: int | None = None) -> None:
+    """Permanently delete a notification channel from the database."""
+    sql, params = "DELETE FROM notification_channels WHERE id=?", [int(channel_id)]
     if user_id is not None:
         sql += " AND user_id=?"
         params.append(int(user_id))

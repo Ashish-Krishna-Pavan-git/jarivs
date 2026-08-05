@@ -1,5 +1,33 @@
 # JARVIS Worklog
 
+## 2026-08-05 - Durable Persistence, Telegram Optionality & Admin Center Enhancements
+
+Primary Goal:
+Ensure total persistence of user data (sources, channels, model providers, settings) across rebuilds/reboots, enforce strict optionality for Telegram notifications, provide robust Slack Upload V2 file delivery, and upgrade the Admin Center with Model Summaries, MCP Auditing, and System Health Observability.
+
+Key Verified Improvements:
+
+1. **Durable Seeding & Persistence (`backend/database/jarvis_db.py`, `storage_backend.py`)**:
+   - `_seed_defaults()` now checks `COUNT(*)` before inserting default template sources, model providers, routes, or integrations.
+   - Deleting or adding a source/channel permanently persists across container restarts, rebuilds, and configuration reloads.
+   - SQLite database (`data/jarvis.db`) is included in Hugging Face Dataset sync (`CRITICAL_FILES`), ensuring data durability on HF Spaces.
+
+2. **Telegram Toggle & Isolation (`backend/config/config.py`, `notifier.py`, `Channels.jsx`)**:
+   - Telegram defaults OFF on Hugging Face Spaces.
+   - When disabled, zero polling loops, webhooks, or requests to `api.telegram.org` execute.
+   - Test UI renders a clear `⚠️ Disabled by config` badge instead of failing.
+
+3. **Slack Upload V2 API (`backend/notifications/slack_notifier.py`)**:
+   - Uses modern 3-step REST upload (`files.getUploadURLExternal` -> POST binary `upload_url` -> `files.completeUploadExternal`).
+   - Webhook-only deployments degrade gracefully with informative text notices.
+
+4. **MCP Source Audit (`backend/mcp/source_auditor.py`, `Mcp.jsx`)**:
+   - Built-in multi-threaded RSS feed auditor evaluating feed reachability, latency, content freshness (>72h), and duplicate rates concurrently.
+
+5. **True One-Button Factory Reset (`backend/app.py`)**:
+   - Wipes all runtime data (`raw_articles/`, `processed/`, `daily/`, `archive/`, `audio/`, `images/`, `podcasts/`, `drafts/`, `reports/`, `cache/`, `seen.json`, `digest_state.json`, `telemetry.json`, `runtime_state.json`, `wordpress_posts.jsonl`, in-memory queue, dedupe cache, `event_logs`).
+   - Preserves user accounts, admin passwords, database schema, RSS sources, AI model providers, notification channels, `.env`, and Hugging Face secrets.
+
 ## 2026-08-03 - Migration to Slack Upload V2 API
 
 Primary Goal:

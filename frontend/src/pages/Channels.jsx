@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Bell, RefreshCw, Slack, Send, CheckCircle, XCircle, Loader2 } from "lucide-react";
+import { Bell, RefreshCw, Slack, Send, CheckCircle, XCircle, Loader2, Trash2 } from "lucide-react";
 import { api } from "../api";
 import { Button, Field, Header, Table } from "../components/ui";
 
@@ -66,7 +66,8 @@ export function Channels({ userMode = false }) {
       .catch((e) => setError(e.message));
   };
 
-  const disable = (id) => {
+  const removeChannel = (id) => {
+    if (!window.confirm("Are you sure you want to delete this notification channel permanently?")) return;
     setError("");
     api(`${base}/${id}`, { method: "DELETE" })
       .then(load)
@@ -114,6 +115,7 @@ export function Channels({ userMode = false }) {
     if (!r) return null;
     if (r.loading) return <span className="test-pending"><Loader2 size={14} className="spin" /> Testing...</span>;
     if (r.ok) return <span className="test-ok"><CheckCircle size={14} /> {r.message || "Sent"}</span>;
+    if (r.reason === "disabled") return <span className="muted" style={{ fontSize: "0.85rem" }}>⚠️ Disabled by config</span>;
     return <span className="test-fail"><XCircle size={14} /> {r.error || "Failed"}</span>;
   };
 
@@ -218,8 +220,8 @@ export function Channels({ userMode = false }) {
             {
               label: "Action",
               render: (r) => (
-                <Button variant="danger" onClick={() => disable(r.id)}>
-                  Disable
+                <Button variant="danger" onClick={() => removeChannel(r.id)}>
+                  <Trash2 size={12} /> Delete
                 </Button>
               ),
             },

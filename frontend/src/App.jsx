@@ -10,6 +10,7 @@ import { UsersPage } from "./pages/admin/Users";
 import { Channels } from "./pages/Channels";
 import { Mcp } from "./pages/admin/Mcp";
 import { Logs } from "./pages/admin/Logs";
+import { Health } from "./pages/admin/Health";
 import { JsonPage } from "./pages/JsonPage";
 import { Feed } from "./pages/user/Feed";
 import { Reports } from "./pages/user/Reports";
@@ -145,7 +146,7 @@ function App() {
         mcp: <Mcp />,
         storage: <JsonPage url="/api/admin/system/storage" title="Storage Status" eyebrow="Persistence" />,
         logs: <Logs />,
-        health: <JsonPage url="/api/admin/system/health" title="System Health" eyebrow="Runtime" />,
+        health: <Health />,
         settings: <JsonPage url="/api/admin/migrations" title="Settings & Migrations" eyebrow="System" />,
       };
       return pages[route] || <Dashboard />;

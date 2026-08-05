@@ -353,11 +353,11 @@ def test_channel(kind, target, secret=None):
     secret = secret or {}
     if kind == "telegram":
         if not IS_TELEGRAM_ENABLED:
-            return {"ok": False, "error": "Telegram is disabled in this deployment."}
+            return {"ok": False, "reason": "disabled", "error": "Telegram is disabled by configuration in this deployment."}
         if not TELEGRAM_TOKEN:
-            return {"ok": False, "error": "TELEGRAM_TOKEN is not configured in .env"}
+            return {"ok": False, "reason": "not_configured", "error": "TELEGRAM_TOKEN is not configured in environment"}
         if not target:
-            return {"ok": False, "error": "Telegram chat ID is required"}
+            return {"ok": False, "reason": "missing_target", "error": "Telegram chat ID is required"}
         res = telegram_post("sendMessage", TELEGRAM_TOKEN, payload={"chat_id": target, "text": "✅ JARVIS test message — your Telegram channel is working."}, connect_timeout=10.0, read_timeout=30.0, max_retries=2)
         if res.get("ok"):
             _log("INFO", "Telegram test message sent", chat_id=target)
@@ -367,7 +367,7 @@ def test_channel(kind, target, secret=None):
         return {"ok": False, "error": err[:300]}
     if kind in ("slack", "slack_audio"):
         if not IS_SLACK_ENABLED:
-            return {"ok": False, "error": "Slack is disabled in this deployment."}
+            return {"ok": False, "reason": "disabled", "error": "Slack is disabled by configuration in this deployment."}
         if kind == "slack_audio":
             from slack_notifier import send_slack_audio
             test_audio_dir = os.path.join(os.getenv("JARVIS_DATA_DIR", "/tmp/jarvis/data"), "audio")

@@ -671,3 +671,118 @@ def ai_weekly_summary(items):
     for item in sorted_items[:40]:
         items_text += f"[{item.get('severity','?')}] {item.get('title','')}\n  {item.get('summary_text','')[:200]}\n\n"
     return extract_json(local_call_premium(build_weekly_prompt(items_text[:12000])))
+
+
+def get_models_summary() -> dict:
+    """
+    Returns a comprehensive model inventory, free vs paid counts, active models,
+    rate-limiting cooldown status, and provider descriptions for Admin UI.
+    """
+    try:
+        from jarvis_db import list_model_providers
+        providers = list_model_providers()
+    except Exception:
+        providers = []
+
+    provider_guides = {
+        "groq": {
+            "title": "Groq LPU Cloud",
+            "tier": "Free Tier Available",
+            "best_for": "Ultra-fast, low-latency bulk article classification & extraction",
+            "rate_limit_info": "30 RPM free tier limit (2.5s interval between requests)",
+        },
+        "gemini": {
+            "title": "Google Gemini AI",
+            "tier": "Free Tier Available",
+            "best_for": "Deep analytical reasoning, multi-article synthesis & executive digests",
+            "rate_limit_info": "15 RPM free tier limit (4.5s interval between requests)",
+        },
+        "ollama": {
+            "title": "Ollama Local (Future / On-Prem)",
+            "tier": "100% Free / Local",
+            "best_for": "Zero-cloud-cost private LLM inference running on local hardware",
+            "rate_limit_info": "No API rate limits (hardware dependent)",
+        },
+        "openrouter": {
+            "title": "OpenRouter Cloud (Future / Multi-Model)",
+            "tier": "Free & Paid Models",
+            "best_for": "Multi-provider routing to DeepSeek, Claude, Llama 3.3, & Qwen",
+            "rate_limit_info": "Varies by selected model & tier",
+        },
+    }
+
+    existing_types = {str(p.get("provider_type")).lower() for p in providers}
+    formatted_providers = []
+    total_models = 0
+    free_models = 0
+    active_models = 0
+    rate_limited_models = 0
+    now = time.time()
+
+    for p in providers:
+        ptype = str(p.get("provider_type", "")).lower()
+        model_name = str(p.get("model", "default"))
+        is_enabled = bool(p.get("enabled", True))
+        is_free = ptype in ("groq", "gemini", "ollama") or "free" in model_name.lower()
+        
+        total_models += 1
+        if is_free: free_models += 1
+        if is_enabled: active_models += 1
+
+        cooldown_rem = 0.0
+        if ptype == "gemini" and (now - _gemini_last[0]) < GEMINI_MIN_INTERVAL:
+            cooldown_rem = round(GEMINI_MIN_INTERVAL - (now - _gemini_last[0]), 1)
+        elif ptype == "groq" and (now - _groq_last[0]) < GROQ_MIN_INTERVAL:
+            cooldown_rem = round(GROQ_MIN_INTERVAL - (now - _groq_last[0]), 1)
+
+        if cooldown_rem > 0:
+            rate_limited_models += 1
+
+        guide = provider_guides.get(ptype, {
+            "title": p.get("name", ptype.upper()),
+            "tier": "Free Tier" if is_free else "Paid Tier",
+            "best_for": "General LLM inference",
+            "rate_limit_info": f"Min interval: {p.get('min_interval', 0)}s",
+        })
+
+        formatted_providers.append({
+            "id": p.get("id"),
+            "name": p.get("name"),
+            "provider_type": ptype,
+            "model": model_name,
+            "enabled": is_enabled,
+            "is_free": is_free,
+            "base_url": p.get("base_url", ""),
+            "api_key_configured": bool(_api_key(p)),
+            "min_interval": float(p.get("min_interval") or 0.0),
+            "cooldown_remaining_sec": cooldown_rem,
+            "guide": guide,
+        })
+
+    for ptype in ["ollama", "openrouter"]:
+        if ptype not in existing_types:
+            formatted_providers.append({
+                "id": None,
+                "name": f"Future Provider: {ptype.upper()}",
+                "provider_type": ptype,
+                "model": "phi4-mini" if ptype == "ollama" else "deepseek/deepseek-r1:free",
+                "enabled": False,
+                "is_free": True,
+                "placeholder": True,
+                "base_url": "http://localhost:11434" if ptype == "ollama" else "https://openrouter.ai/api/v1",
+                "api_key_configured": False,
+                "min_interval": 0.0,
+                "cooldown_remaining_sec": 0.0,
+                "guide": provider_guides[ptype],
+            })
+            total_models += 1
+            free_models += 1
+
+    return {
+        "total_models": total_models,
+        "free_models": free_models,
+        "active_models": active_models,
+        "rate_limited_models": rate_limited_models,
+        "providers": formatted_providers,
+        "ai_status": get_ai_status(),
+    }

@@ -34,6 +34,7 @@ CRITICAL_FILES = [
     "telemetry.json",
     "runtime_state.json",
     "data/subscribers.json",
+    "data/jarvis.db",
 ]
 OPTIONAL_FILES = ["provider_state.json"]
 BUNDLE_FILE    = "articles_bundle.json"
@@ -145,12 +146,35 @@ def pull_state(working_dir="."):
         if _download(fname, dest):
             print(f"[HF_STORAGE] ✓ Pulled {fname} (optional)")
     _pull_digests()   # Restore digest files so daily summary has content
+
+    # Restore active SQLite jarvis.db
+    db_path = os.getenv("JARVIS_DB_PATH", "/tmp/jarvis/data/jarvis.db")
+    pulled_db = os.path.join(working_dir, "data", "jarvis.db")
+    if os.path.exists(pulled_db):
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        try:
+            shutil.copy2(pulled_db, db_path)
+            print(f"[HF_STORAGE] ✓ Restored active SQLite database to {db_path}")
+        except Exception as exc:
+            print(f"[HF_STORAGE] DB copy warning: {exc}")
+
     print(f"[HF_STORAGE] Pull done: {pulled}/{len(CRITICAL_FILES)} files restored")
     return True
 
 
 def push_state(working_dir=".", new_articles=None, cycle_num=None):
     if not _enabled(): return False
+
+    # Copy active SQLite jarvis.db to working_dir/data/jarvis.db before pushing
+    db_path = os.getenv("JARVIS_DB_PATH", "/tmp/jarvis/data/jarvis.db")
+    if os.path.exists(db_path):
+        target_db = os.path.join(working_dir, "data", "jarvis.db")
+        os.makedirs(os.path.dirname(target_db), exist_ok=True)
+        try:
+            shutil.copy2(db_path, target_db)
+        except Exception:
+            pass
+
     pushed = 0
     for fname in CRITICAL_FILES:
         src = os.path.join(working_dir, fname)
